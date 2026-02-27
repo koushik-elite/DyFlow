@@ -180,7 +180,7 @@ class ToolAwareWorkflowExecutor:
 
         # Lazy import to avoid circular dependency with original codebase
         from .state import State
-        self.state = State(problem_description=problem_description)
+        self.state = State(original_problem=problem_description)
 
     # ── Public entry point ────────────────────────────────────────────────────
 
@@ -372,7 +372,7 @@ class ToolAwareWorkflowExecutor:
 
     def _summarise_state(self) -> str:
         """Build a compact summary of state for the designer prompt."""
-        lines = [f"Problem: {self.problem_description[:200]}"]
+        lines = [f"Problem: {self.state.original_problem[:200]}"]
         for key, action in self.state.actions.items():
             content = action.get("content", "")
             preview = content[:300].replace("\n", " ") if content else "(empty)"
