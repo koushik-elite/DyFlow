@@ -9,10 +9,10 @@ SFT format: Only includes correct samples (label=True)
 
 Usage:
     # Generate KTO data from training set
-    python train/generate_training_data.py --baseline DyFlow --model phi-4 --output train/kto_data.json --format kto --mode train
+    python train/generate_training_data.py --baseline DyFlow --model gemini-2.5-flash --output train/kto_data.json --format kto --mode train
 
     # Generate SFT data from training set
-    python train/generate_training_data.py --baseline DyFlow --model phi-4 --output train/sft_data.json --format sft --mode train
+    python train/generate_training_data.py --baseline DyFlow --model gemini-2.5-flash --output train/sft_data.json --format sft --mode train
 
 Input: Benchmark result files from benchmarks/results/{benchmark}/{mode}/{baseline}_{model}.json
 Output: Training data in JSON format compatible with LLaMA-Factory (https://github.com/hiyouga/LLaMA-Factory)
@@ -254,8 +254,8 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Generate training data from DyFlow benchmark results')
     parser.add_argument('--baseline', type=str, default='DyFlow',
                         help='Baseline name (default: DyFlow)')
-    parser.add_argument('--model', type=str, default='phi-4',
-                        help='Execution model name (default: phi-4)')
+    parser.add_argument('--model', type=str, default='gemini-2.5-flash',
+                        help='Execution model name (default: gemini-2.5-flash)')
     parser.add_argument('--output', type=str, default='train/training_data.json',
                         help='Output file path (default: train/training_data.json)')
     parser.add_argument('--format', type=str, choices=['kto', 'sft'], default='kto',
