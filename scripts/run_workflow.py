@@ -25,8 +25,8 @@ def main():
     # Create Designer and Executor services
     # Designer: Plans the problem-solving strategy
     # Executor: Executes the planned steps
-    designer_service = ModelService(model="gpt-4.1")
-    executor_service = ModelService(model="phi-4")
+    designer_service = ModelService(model="gemini-2.5-flash")
+    executor_service = ModelService(model="gemini-2.5-flash")
 
     # Alternative: Use local models
     # designer_service = ModelService.local()
