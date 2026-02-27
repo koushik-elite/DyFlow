@@ -14,6 +14,14 @@ except ImportError:  # pragma: no cover - optional dependency
     AsyncOpenAI = None  # type: ignore
     OpenAI = None  # type: ignore
 
+try:
+    import google.generativeai as genai  # type: ignore
+    from google.generativeai import GenerativeModel, GenerationConfig  # type: ignore
+except ImportError:  # pragma: no cover - optional dependency
+    genai = None  # type: ignore
+    GenerativeModel = None  # type: ignore
+    GenerationConfig = None  # type: ignore
+
 from .config import ENV_VARS, MODEL_MAPPING
 from .utils import retry_decorator
 
@@ -32,6 +40,7 @@ class ModelClients:
         self._yi_client = None
         self._async_yi_client = None
         self._local_client = None
+        self._gemini_client = None
     
     def _init_openai(self):
         """Initialize OpenAI client"""
@@ -128,6 +137,18 @@ class ModelClients:
             base_url='http://localhost:8000/v1/'
         )
 
+    def _init_gemini(self):
+        """Initialize Gemini client by configuring the google.generativeai SDK"""
+        if genai is None:
+            print("Warning: google-generativeai package not installed. Run: pip install google-generativeai")
+            return None
+        api_key = os.getenv(ENV_VARS['gemini'])
+        if not api_key:
+            print(f"Warning: Gemini API key not found in environment variable {ENV_VARS['gemini']}")
+            return None
+        genai.configure(api_key=api_key)
+        return genai  # Return the configured module; GenerativeModel is instantiated per-call
+
     # Lazy loading properties
     @property
     def openai_client(self):
@@ -185,6 +206,13 @@ class ModelClients:
             self._local_client = self._init_local()
         return self._local_client
 
+    @property
+    def gemini_client(self):
+        """Lazy load Gemini client (configured google.generativeai module)"""
+        if self._gemini_client is None:
+            self._gemini_client = self._init_gemini()
+        return self._gemini_client
+
     def get_client(self, model_type: str):
         """Get the appropriate client for the model type (with lazy loading)"""
         # Use dictionary with property getters to ensure lazy loading
@@ -193,7 +221,8 @@ class ModelClients:
             'anthropic': self.anthropic_client,
             'deepinfra': self.deepinfra_client,
             'yi': self.yi_client,
-            'local': self.local_client
+            'local': self.local_client,
+            'gemini': self.gemini_client,
         }
         
         if model_type not in clients:
@@ -351,6 +380,85 @@ class ModelClients:
         )
         
         return response.choices[0].message.parsed
+
+    @retry_decorator(max_retries=3, delay=1, backoff=2)
+    def call_gemini(self, model: str, prompt: str, temperature: float = 0.001,
+                    max_tokens: int = 8192, msg: list = None) -> str:
+        """Call Google Gemini models via the google-generativeai SDK.
+
+        Args:
+            model: User-friendly model name (e.g. 'gemini-2.5-flash').
+            prompt: The input prompt string.
+            temperature: Sampling temperature.
+            max_tokens: Maximum output tokens (default 8192 for Gemini).
+            msg: Optional pre-formatted message list. Each item should be a
+                 dict with 'role' ('user' / 'model') and 'parts' (list of str).
+                 If None, the prompt string is wrapped into a single user turn.
+
+        Returns:
+            Tuple of (response_text, tokens_dict).
+        """
+        if GenerativeModel is None or GenerationConfig is None:
+            raise RuntimeError(
+                "google-generativeai is not installed. Run: pip install google-generativeai"
+            )
+
+        # Ensure the SDK is configured (triggers lazy init)
+        _ = self.gemini_client
+
+        client = GenerativeModel(MODEL_MAPPING[model])
+
+        if msg is None:
+            messages = prompt
+        else:
+            messages = msg
+
+        generation_config = GenerationConfig(
+            temperature=temperature,
+            max_output_tokens=max_tokens,
+        )
+
+        response = client.generate_content(
+            messages,
+            generation_config=generation_config,
+        )
+
+        # Extract final answer — handle multi-turn / tool-call responses
+        final_answer = self._process_gemini_response(response)
+
+        input_tokens  = response.usage_metadata.prompt_token_count
+        output_tokens = response.usage_metadata.candidates_token_count
+
+        tokens = {
+            'input_tokens':  input_tokens,
+            'output_tokens': output_tokens,
+        }
+
+        return final_answer, tokens
+
+    def _process_gemini_response(self, response) -> str:
+        """Extract the text content from a Gemini GenerateContentResponse.
+
+        Handles simple text responses and multi-part candidates gracefully.
+        """
+        try:
+            # Fast path: single text candidate
+            return response.text
+        except (AttributeError, ValueError):
+            pass
+
+        # Walk candidates → parts to collect all text
+        texts = []
+        for candidate in getattr(response, 'candidates', []):
+            for part in getattr(candidate.content, 'parts', []):
+                text = getattr(part, 'text', None)
+                if text:
+                    texts.append(text)
+
+        if texts:
+            return '\n'.join(texts)
+
+        return "(Gemini returned no text content)"
 
     @retry_decorator(max_retries=3, delay=1, backoff=2)
     def call_local(self, model: str, prompt: str, temperature: float = 0.001, msg: list = None) -> str:

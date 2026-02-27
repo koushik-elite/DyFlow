@@ -44,7 +44,13 @@ MODEL_MAPPING = {
     'qwen3-235B-A22B': 'Qwen/Qwen3-235B-A22B',
     'llama-4-scout': 'meta-llama/Llama-4-Scout-17B-16E-Instruct',
     'qwen3-14B': 'Qwen/Qwen3-14B',
-    'local': ''
+    'local': '',
+    # Gemini models
+    'gemini-2.5-flash': 'gemini-2.5-flash',
+    'gemini-2.5-pro': 'gemini-2.5-pro',
+    'gemini-2.0-flash': 'gemini-2.0-flash',
+    'gemini-1.5-pro': 'gemini-1.5-pro',
+    'gemini-1.5-flash': 'gemini-1.5-flash',
 }
 
 # Model categories for client selection
@@ -53,6 +59,7 @@ DEEPINFRA_MODELS = ['llama-3.1-70B', 'llama-3.1-8B', 'qwen-2.5-72B', 'gemma-2-27
                     'llama-3.3-70B', 'qwen-2.5-7B', 'deepseek-r1', 'gemma-3-27B', 'gemma-3-4B', 'gemma-3-12B', 'deepseek-v3', 'phi-4', 'qwen3-235B-A22B', 'llama-4-scout', 'qwen3-14B']
 YI_MODELS = ['yi-lightning']
 LOCAL_MODELS = ['local']
+GEMINI_MODELS = ['gemini-2.5-flash', 'gemini-2.5-pro', 'gemini-2.0-flash', 'gemini-1.5-pro', 'gemini-1.5-flash']
 STRUCTURED_OUTPUT_SUPPORT = ['gpt-4o', 'gpt-4o-mini', 'chatgpt-4o-latest']
 
 # Environment variables
@@ -66,7 +73,8 @@ ENV_VARS = {
     'yi': {
         'api_key': 'YI_API_KEY',
         'base_url': 'YI_BASE_URL'
-    }
+    },
+    'gemini': 'GEMINI_API_KEY',
 }
 
 def get_available_models():
@@ -83,5 +91,7 @@ def get_model_category(model_name):
         return 'yi'
     elif model_name in LOCAL_MODELS:
         return 'local'
+    elif model_name in GEMINI_MODELS:
+        return 'gemini'
     else:
         return 'openai'
