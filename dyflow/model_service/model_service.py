@@ -36,7 +36,7 @@ class ModelService:
             cls._clients = ModelClients()
         return cls._clients
 
-    def __init__(self, model: str = 'chatgpt-4o-latest', temperature: float = 0.01, lock: threading.Lock = None):
+    def __init__(self, model: str = 'gemini-2.5-flash', temperature: float = 0.01, lock: threading.Lock = None):
         """
         Initialize the model service with a specific model
         
@@ -62,7 +62,7 @@ class ModelService:
         self.lock = lock
         
     @classmethod
-    def create(cls, model: str = 'chatgpt-4o-latest', temperature: float = 0.01) -> 'ModelService':
+    def create(cls, model: str = 'gemini-2.5-flash', temperature: float = 0.01) -> 'ModelService':
         """Factory method to create a new ModelService instance"""
         return cls(model=model, temperature=temperature)
     

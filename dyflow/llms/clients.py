@@ -14,7 +14,7 @@ class ExecutorLLMClient:
     This client is used to execute specific instructions in the workflow.
     """
     
-    def __init__(self, model_name: str = "gpt-4o-mini"):
+    def __init__(self, model_name: str = "gemini-2.5-flash"):
         """
         Initialize the executor LLM client.
         
@@ -51,7 +51,7 @@ class DesignerLLMClient:
     """
     Client for the designer LLM.
     """
-    def __init__(self, model_name: str = "gpt-4o"):
+    def __init__(self, model_name: str = "gemini-2.5-flash"):
         """
         Initialize the designer LLM client.
 

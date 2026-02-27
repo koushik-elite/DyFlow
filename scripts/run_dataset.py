@@ -28,10 +28,9 @@ from dyflow.core.workflow import WorkflowExecutor
 from dyflow.model_service import ModelService
 
 # Configure model services
-# designer_service = ModelService(model='gpt-4.1')
-designer_service = ModelService.local()
-executor_service = ModelService(model='phi-4', temperature=0.01)
-judge_service = ModelService(model='gpt-4.1-mini')
+designer_service = ModelService(model='gemini-2.5-flash')
+executor_service = ModelService(model='gemini-2.5-flash', temperature=0.01)
+judge_service = ModelService(model='gemini-2.5-flash')
 
 
 def run_workflow_single(question: str, task_name: str):
@@ -167,7 +166,7 @@ def run_workflow(task_name: str, baseline: str, mode: str, size: int = None, max
     print(f"{'='*60}\n")
 
     benchmark = reasoning_task[task_name]['benchmark'](
-        execution_model='phi-4',
+        execution_model='gemini-2.5-flash',
         baseline=baseline,
         mode=mode
     )
