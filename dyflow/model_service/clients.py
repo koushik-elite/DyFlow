@@ -230,45 +230,48 @@ class ModelClients:
 
     def get_client(self, model_type: str):
         """Get the appropriate client for the model type (with lazy loading)"""
-        # Use dictionary with property getters to ensure lazy loading
-        clients = {
-            'openai': self.openai_client,
-            'anthropic': self.anthropic_client,
-            'deepinfra': self.deepinfra_client,
-            'yi': self.yi_client,
-            'local': self.local_client,
-            'gemini': self.gemini_client,
+        client_map = {
+            'openai':    lambda: self.openai_client,
+            'anthropic': lambda: self.anthropic_client,
+            'deepinfra': lambda: self.deepinfra_client,
+            'yi':        lambda: self.yi_client,
+            'local':     lambda: self.local_client,
+            'gemini':    lambda: self.gemini_client,
         }
-        
-        if model_type not in clients:
+
+        if model_type not in client_map:
             raise ValueError(f"Unknown model type: {model_type}")
-        
-        client = clients[model_type]
+
+        client = client_map[model_type]()
         if client is None:
             env_var = ENV_VARS.get(model_type, f"{model_type}_api_key")
-            raise ValueError(f"Client for {model_type} is not configured properly. Please check the {env_var} environment variable.")
-        
+            raise ValueError(
+                f"Client for {model_type} is not configured properly. "
+                f"Please check the {env_var} environment variable."
+            )
         return client
     
     def get_async_client(self, model_type: str):
         """Get the appropriate async client for the model type (with lazy loading)"""
-        # Use dictionary with property getters to ensure lazy loading
-        clients = {
-            'openai': self.async_openai_client,
-            'anthropic': self.anthropic_client,  # Note: Anthropic might not have async API
-            'deepinfra': self.async_deepinfra_client,
-            'yi': self.async_yi_client,
-            'local': self.local_client  # Local client doesn't support async
+        client_map = {
+            'openai':    lambda: self.async_openai_client,
+            'anthropic': lambda: self.anthropic_client,
+            'deepinfra': lambda: self.async_deepinfra_client,
+            'yi':        lambda: self.async_yi_client,
+            'local':     lambda: self.local_client,
+            'gemini':    lambda: self.gemini_client,
         }
-        
-        if model_type not in clients:
+
+        if model_type not in client_map:
             raise ValueError(f"Unknown model type: {model_type}")
-        
-        client = clients[model_type]
+
+        client = client_map[model_type]()
         if client is None:
             env_var = ENV_VARS.get(model_type, f"{model_type}_api_key")
-            raise ValueError(f"Async client for {model_type} is not configured properly. Please check the {env_var} environment variable.")
-        
+            raise ValueError(
+                f"Async client for {model_type} is not configured properly. "
+                f"Please check the {env_var} environment variable."
+            )
         return client
 
     @retry_decorator(max_retries=3, delay=1, backoff=2)
