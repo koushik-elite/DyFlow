@@ -15,10 +15,10 @@ except ImportError:  # pragma: no cover - optional dependency
     OpenAI = None  # type: ignore
 
 try:
-    import google.generativeai as genai  # type: ignore
-    from google.generativeai import GenerativeModel, GenerationConfig  # type: ignore
+    import vertexai  # type: ignore
+    from vertexai.generative_models import GenerativeModel, GenerationConfig  # type: ignore
 except ImportError:  # pragma: no cover - optional dependency
-    genai = None  # type: ignore
+    vertexai = None  # type: ignore
     GenerativeModel = None  # type: ignore
     GenerationConfig = None  # type: ignore
 
@@ -138,16 +138,31 @@ class ModelClients:
         )
 
     def _init_gemini(self):
-        """Initialize Gemini client by configuring the google.generativeai SDK"""
-        if genai is None:
-            print("Warning: google-generativeai package not installed. Run: pip install google-generativeai")
+        """Initialize Gemini client via Vertex AI (no API key required).
+
+        Authenticates using Application Default Credentials (ADC).
+        Set credentials with: gcloud auth application-default login
+
+        Required env vars:
+            GOOGLE_CLOUD_PROJECT  — GCP project ID
+            GOOGLE_CLOUD_LOCATION — region (default: 'global')
+        """
+        if vertexai is None:
+            print(
+                "Warning: google-cloud-aiplatform package not installed. "
+                "Run: pip install google-cloud-aiplatform"
+            )
             return None
-        api_key = os.getenv(ENV_VARS['gemini'])
-        if not api_key:
-            print(f"Warning: Gemini API key not found in environment variable {ENV_VARS['gemini']}")
+        project_id = os.getenv(ENV_VARS['gemini']['project'])
+        location   = os.getenv(ENV_VARS['gemini']['location'], 'global')
+        if not project_id:
+            print(
+                f"Warning: GCP project ID not found in environment variable "
+                f"{ENV_VARS['gemini']['project']}"
+            )
             return None
-        genai.configure(api_key=api_key)
-        return genai  # Return the configured module; GenerativeModel is instantiated per-call
+        vertexai.init(project=project_id, location=location)
+        return vertexai  # SDK is now initialised; GenerativeModel is instantiated per-call
 
     # Lazy loading properties
     @property
@@ -208,7 +223,7 @@ class ModelClients:
 
     @property
     def gemini_client(self):
-        """Lazy load Gemini client (configured google.generativeai module)"""
+        """Lazy load Gemini client (initialises Vertex AI SDK with project + location)"""
         if self._gemini_client is None:
             self._gemini_client = self._init_gemini()
         return self._gemini_client
@@ -384,26 +399,31 @@ class ModelClients:
     @retry_decorator(max_retries=3, delay=1, backoff=2)
     def call_gemini(self, model: str, prompt: str, temperature: float = 0.001,
                     max_tokens: int = 8192, msg: list = None) -> str:
-        """Call Google Gemini models via the google-generativeai SDK.
+        """Call Google Gemini models via Vertex AI SDK.
+
+        Authentication uses Application Default Credentials (ADC) —
+        no API key required. Initialise with:
+            gcloud auth application-default login
 
         Args:
             model: User-friendly model name (e.g. 'gemini-2.5-flash').
             prompt: The input prompt string.
             temperature: Sampling temperature.
             max_tokens: Maximum output tokens (default 8192 for Gemini).
-            msg: Optional pre-formatted message list. Each item should be a
-                 dict with 'role' ('user' / 'model') and 'parts' (list of str).
-                 If None, the prompt string is wrapped into a single user turn.
+            msg: Optional pre-formatted contents list compatible with the
+                 Vertex AI GenerativeModel.generate_content() interface.
+                 If None, the prompt string is used directly.
 
         Returns:
             Tuple of (response_text, tokens_dict).
         """
         if GenerativeModel is None or GenerationConfig is None:
             raise RuntimeError(
-                "google-generativeai is not installed. Run: pip install google-generativeai"
+                "google-cloud-aiplatform is not installed. "
+                "Run: pip install google-cloud-aiplatform"
             )
 
-        # Ensure the SDK is configured (triggers lazy init)
+        # Ensure vertexai.init() has been called (triggers lazy init)
         _ = self.gemini_client
 
         client = GenerativeModel(MODEL_MAPPING[model])

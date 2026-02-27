@@ -46,11 +46,12 @@ MODEL_MAPPING = {
     'qwen3-14B': 'Qwen/Qwen3-14B',
     'local': '',
     # Gemini models
-    'gemini-2.5-flash': 'gemini-2.5-flash',
-    'gemini-2.5-pro': 'gemini-2.5-pro',
-    'gemini-2.0-flash': 'gemini-2.0-flash',
-    'gemini-1.5-pro': 'gemini-1.5-pro',
-    'gemini-1.5-flash': 'gemini-1.5-flash',
+    # Gemini models via Vertex AI (versioned stable IDs)
+    'gemini-2.5-flash': 'gemini-2.5-flash-preview-04-17',
+    'gemini-2.5-pro': 'gemini-2.5-pro-preview-03-25',
+    'gemini-2.0-flash': 'gemini-2.0-flash-001',
+    'gemini-1.5-pro': 'gemini-1.5-pro-002',
+    'gemini-1.5-flash': 'gemini-1.5-flash-002',
 }
 
 # Model categories for client selection
@@ -74,7 +75,10 @@ ENV_VARS = {
         'api_key': 'YI_API_KEY',
         'base_url': 'YI_BASE_URL'
     },
-    'gemini': 'GEMINI_API_KEY',
+    'gemini': {
+        'project':  'GOOGLE_CLOUD_PROJECT',
+        'location': 'GOOGLE_CLOUD_LOCATION',   # defaults to 'global' if unset
+    },
 }
 
 def get_available_models():
