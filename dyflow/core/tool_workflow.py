@@ -222,6 +222,12 @@ class ToolAwareWorkflowExecutor:
         from .state import State
         self.state = State(original_problem=problem_description)
 
+        # Pre-seed any structured fields embedded in the problem description
+        # into state.actions so operators can reference them via input_keys.
+        # e.g. "Database: e_commerce\n\nSchema:\nCREATE TABLE ..."
+        # becomes state.actions["database"] and state.actions["schema"]
+        self._seed_problem_fields(problem_description)
+
     # ── Public entry point ────────────────────────────────────────────────────
 
     def run(self, max_steps: int = 7) -> Tuple[str, Any]:
@@ -440,6 +446,27 @@ class ToolAwareWorkflowExecutor:
                 print(f"    [Re-run {op_type}] query='{refined_query[:60]}'")
                 self._dispatch_operator(rerun_op_id, f"Re-run {op_type}", op_type, rerun_params)
                 break
+
+    def _seed_problem_fields(self, problem_description: str) -> None:
+        """
+        Parse labelled sections from the problem description and pre-populate
+        state.actions so operators can reference them via input_keys.
+
+        Handles two formats:
+          Single-line:  "Database: e_commerce"
+          Multi-line:   "Schema:\nCREATE TABLE ..."  (runs until next label or EOF)
+        """
+        # Match "Label:" at the start of a line followed by content
+        pattern = re.compile(
+            r"^([A-Za-z][A-Za-z0-9_ ]{0,30})\s*:\s*(.+?)(?=\n[A-Za-z][A-Za-z0-9_ ]{0,30}\s*:|$)",
+            re.MULTILINE | re.DOTALL,
+        )
+        for match in pattern.finditer(problem_description):
+            key     = match.group(1).strip().lower().replace(" ", "_")
+            value   = match.group(2).strip()
+            if key and value:
+                self.state.actions[key] = {"content": value}
+                logger.debug(f"[seed] {key} = {value[:60]}")
 
     # ── State utilities ───────────────────────────────────────────────────────
 
