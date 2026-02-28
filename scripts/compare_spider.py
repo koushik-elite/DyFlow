@@ -113,6 +113,7 @@ def build_report(
     args,
     elapsed_dyflow:   float,
     elapsed_dyflow_t: float,
+    dataset:          str = "spider",
 ) -> dict:
     """Merge two result lists into a comparison report."""
 
@@ -195,8 +196,8 @@ def build_report(
     report = {
         "meta": {
             "timestamp":  str(datetime.datetime.now()),
-            "dataset":    "Spider",
-            "mode":       args.mode,
+            "dataset":    dataset.upper(),
+            "mode":       args.mode if not args.sample else "sample",
             "size":       args.size or "all",
             "model":      "gemini-2.5-flash",
         },
@@ -243,12 +244,12 @@ def print_report(report: dict) -> None:
     print(f"{'Elapsed (sec)':<30} {df['elapsed_sec']:>12} {dft['elapsed_sec']:>12}")
     print("-" * 65)
 
-    # Per-hardness
+    # Per-hardness: Spider labels + BIRD labels
     all_levels = sorted(set(
         list(df["hardness_accuracy"].keys()) +
         list(dft["hardness_accuracy"].keys())
     ))
-    for h in ["easy", "medium", "hard", "extra", "unknown"]:
+    for h in ["easy", "simple", "medium", "moderate", "hard", "challenging", "extra", "unknown"]:
         if h in all_levels:
             dfa  = df["hardness_accuracy"].get(h, 0.0)
             dfta = dft["hardness_accuracy"].get(h, 0.0)
@@ -271,28 +272,39 @@ def print_report(report: dict) -> None:
 def run_comparison(args):
     import time
 
+    dataset   = args.dataset.lower()
+    data_dir  = os.path.join(REPO_ROOT, "benchmarks", "data",
+                             "BIRD" if dataset == "bird" else "Spider")
+
     if args.sample:
         db_root      = SAMPLE_DIR
         dataset_path = os.path.join(SAMPLE_DIR, "spider_sample.json")
         mode_label   = "sample"
+        dataset      = "spider"
         if not os.path.exists(dataset_path):
             print("[ERROR] Sample DB not found. Run:")
             print("        python scripts/install_spider.py --sample-only")
             sys.exit(1)
     else:
-        db_root      = os.path.join(DATA_DIR, "databases")
-        dataset_path = os.path.join(DATA_DIR, f"spider_{args.mode}.json")
+        db_root      = os.path.join(data_dir, "databases")
+        dataset_path = os.path.join(data_dir, f"{dataset}_{args.mode}.json")
         mode_label   = args.mode
         if not os.path.exists(dataset_path):
+            installer = "install_bird.py" if dataset == "bird" else "install_spider.py"
             print(f"[ERROR] Dataset not found: {dataset_path}")
-            print("        Run: python scripts/install_spider.py")
+            print(f"        Run: python scripts/{installer}")
             sys.exit(1)
 
     os.makedirs(REPORT_DIR, exist_ok=True)
 
     print("=" * 65)
-    print("Spider Comparison: DyFlow vs DyFlow-T")
+    print(f"{dataset.upper()} Comparison: DyFlow (no tool) vs DyFlow-T (SQL tool)")
     print("=" * 65)
+    if dataset == "bird":
+        print("BIRD advantage for tool comparison:")
+        print("  • Real databases with up to 33,000 rows")
+        print("  • LLM cannot hallucinate correct COUNT/SUM/AVG over real data")
+        print("  • Tool execution gap expected to be larger than Spider")
     print(f"Mode     : {mode_label}")
     print(f"Size     : {args.size or 'all'}")
     print(f"Workers  : {args.workers}")
@@ -308,11 +320,12 @@ def run_comparison(args):
         baseline="DyFlow",
         mode=mode_label,
         db_root=db_root,
+        dataset=dataset,
     )
     bench_df.dataset_path = dataset_path
-    bench_df.output_path  = os.path.join(REPORT_DIR, f"dyflow_{mode_label}.json")
-    bench_df.cost_path    = os.path.join(REPORT_DIR, f"dyflow_{mode_label}_cost.json")
-    bench_df.metrics_path = os.path.join(REPORT_DIR, f"dyflow_{mode_label}_metrics.json")
+    bench_df.output_path  = os.path.join(REPORT_DIR, f"dyflow_{dataset}_{mode_label}.json")
+    bench_df.cost_path    = os.path.join(REPORT_DIR, f"dyflow_{dataset}_{mode_label}_cost.json")
+    bench_df.metrics_path = os.path.join(REPORT_DIR, f"dyflow_{dataset}_{mode_label}_metrics.json")
 
     t0 = time.time()
     dyflow_results = bench_df.evaluate_all_problems(
@@ -331,11 +344,12 @@ def run_comparison(args):
         baseline="DyFlow-T",
         mode=mode_label,
         db_root=db_root,
+        dataset=dataset,
     )
     bench_dft.dataset_path = dataset_path
-    bench_dft.output_path  = os.path.join(REPORT_DIR, f"dyflow_t_{mode_label}.json")
-    bench_dft.cost_path    = os.path.join(REPORT_DIR, f"dyflow_t_{mode_label}_cost.json")
-    bench_dft.metrics_path = os.path.join(REPORT_DIR, f"dyflow_t_{mode_label}_metrics.json")
+    bench_dft.output_path  = os.path.join(REPORT_DIR, f"dyflow_t_{dataset}_{mode_label}.json")
+    bench_dft.cost_path    = os.path.join(REPORT_DIR, f"dyflow_t_{dataset}_{mode_label}_cost.json")
+    bench_dft.metrics_path = os.path.join(REPORT_DIR, f"dyflow_t_{dataset}_{mode_label}_metrics.json")
 
     t0 = time.time()
     dyflow_t_results = bench_dft.evaluate_all_problems(
@@ -351,10 +365,12 @@ def run_comparison(args):
     report = build_report(
         dyflow_results, dyflow_t_results, args,
         elapsed_dyflow, elapsed_dyflow_t,
+        dataset=dataset,
     )
 
     report_path = os.path.join(
-        REPORT_DIR, f"comparison_{mode_label}_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+        REPORT_DIR,
+        f"comparison_{dataset}_{mode_label}_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
     )
     with open(report_path, "w", encoding="utf-8") as f:
         json.dump(report, f, indent=2, ensure_ascii=False)
@@ -396,6 +412,10 @@ if __name__ == "__main__":
     parser.add_argument(
         "--mode", type=str, default="dev", choices=["dev", "train"],
         help="Spider split to evaluate (default: dev)",
+    )
+    parser.add_argument(
+        "--dataset", type=str, default="spider", choices=["spider", "bird"],
+        help="Which dataset to compare on (default: spider)",
     )
     parser.add_argument(
         "--size", type=int, default=None,

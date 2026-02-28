@@ -147,13 +147,14 @@ class SpiderBenchmark(BaseBenchmark):
         except Exception as exc:
             return f"(schema error: {exc})"
 
-    def _build_question_prompt(self, question: str, db_id: str) -> str:
+    def _build_question_prompt(self, question: str, db_id: str, evidence: str = "") -> str:
         schema = self._get_schema(db_id)
+        evidence_block = f"\nDomain Hint: {evidence}" if evidence else ""
         return (
             f"You are an expert SQL assistant.\n\n"
             f"Database: {db_id}\n\n"
             f"Schema:\n{schema}\n\n"
-            f"Question: {question}\n\n"
+            f"Question: {question}{evidence_block}\n\n"
             "Write a single valid SQLite SELECT query to answer the question.\n"
             "Return ONLY the SQL query inside a ```sql ... ``` code block."
         )
@@ -197,9 +198,10 @@ class SpiderBenchmark(BaseBenchmark):
         question  = problem.get("question", "")
         gold_sql  = problem.get("query", "")
         hardness  = problem.get("hardness", "unknown")
+        evidence  = problem.get("evidence", "")   # BIRD-specific domain hint
 
         # Enrich question with schema so the workflow has full context
-        enriched_q = self._build_question_prompt(question, db_id)
+        enriched_q = self._build_question_prompt(question, db_id, evidence)
 
         # Generate predicted SQL
         try:
@@ -387,10 +389,11 @@ class SpiderBenchmark(BaseBenchmark):
         print(f"Correct    : {correct}")
         print(f"EX Accuracy: {overall_ex:.2%}")
         print("-" * 40)
-        for h in ["easy", "medium", "hard", "extra", "unknown"]:
+        # Spider labels           BIRD labels
+        for h in ["easy", "simple", "medium", "moderate", "hard", "challenging", "extra", "unknown"]:
             if h in hardness_acc:
                 s = hardness_stats[h]
-                print(f"  {h:<8}: {hardness_acc[h]:.2%}  ({s['correct']}/{s['total']})")
+                print(f"  {h:<12}: {hardness_acc[h]:.2%}  ({s['correct']}/{s['total']})")
         print("=" * 60)
 
         return metrics
