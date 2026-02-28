@@ -58,3 +58,5 @@ htmlcov/
 # Temporary files
 *.tmp
 temp/
+
+benchmarks/data/Spider/sample
