@@ -128,8 +128,8 @@ Row Count: <number of rows returned>
 Error Details: <if applicable>""",
 
     # ── TOOL_REVIEW ───────────────────────────────────────────────────────────
-    "TOOL_REVIEW": """You are an auditor of externally retrieved information. Your role is to
-assess whether the tool output is relevant and usable for the current subgoal.
+    "TOOL_REVIEW": """You are a pragmatic reviewer of tool outputs. Your role is to
+check whether the result is usable for the current subgoal — not to judge perfection.
 
 Context:
 {context}
@@ -142,21 +142,30 @@ Tool Input (Query/Parameters): {tool_input}
 Tool Output:
 {tool_output}
 
-Instructions:
-- Assess whether the tool output is relevant to the subgoal (even partially).
-- Check if the output contains real data (not mock/placeholder/error content).
-- Accept partial results — RESULT_EXTRACT will refine them further downstream.
-- Use 'retry_with_refinement' ONLY if the query was completely off-topic or wrong.
-- Use 'reject' ONLY if the output is entirely empty, all mock data, or a tool error.
-- If the output contains ANY real, on-topic information — verdict MUST be 'accept'.
-- The Recommended Action MUST match the verdict exactly:
-    accept               → Recommended Action: proceed
-    retry_with_refinement → Recommended Action: invoke TOOL_REFINE
-    reject               → Recommended Action: escalate to designer
+Review Rules (apply based on tool type):
+
+For WEB_SEARCH results:
+  - accept  → output contains ANY real, on-topic information
+  - retry_with_refinement → query was completely off-topic or returned only ads/spam
+  - reject  → output is empty, all mock/placeholder data, or a tool error
+
+For SQL_QUERY results:
+  - accept  → query executed without error and returned rows (even if partial)
+  - accept  → query returned 0 rows and that IS a valid answer (e.g. "no results found")
+  - retry_with_refinement → SQL syntax error, wrong table/column name, or clearly wrong logic
+  - reject  → database connection error or tool completely failed to execute
+
+General rule: partial or incomplete results → accept (RESULT_EXTRACT handles refinement).
+Never reject just because the result is not 100% complete.
+
+The Recommended Action MUST match the verdict:
+  accept               → Recommended Action: proceed
+  retry_with_refinement → Recommended Action: invoke TOOL_REFINE
+  reject               → Recommended Action: escalate to designer
 
 Output Format:
 Relevance Check: <yes / partial / no>
-Accuracy Assessment: <are the facts real and on-topic?>
+Accuracy Assessment: <are the facts real and on-topic? did SQL execute correctly?>
 Completeness: <sufficient / partial / insufficient>
 Identified Issues:
   - <issue or "none">
