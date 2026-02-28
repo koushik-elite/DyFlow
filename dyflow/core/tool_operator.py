@@ -145,17 +145,21 @@ Tool Output:
 Instructions:
 - Assess whether the tool output is relevant to the subgoal (even partially).
 - Check if the output contains real data (not mock/placeholder/error content).
-- Accept partial results — RESULT_EXTRACT will refine them further.
-- Only use 'retry_with_refinement' if the query itself was wrong (wrong topic, wrong database).
-- Only use 'reject' if the output is completely empty, all mock data, or a tool error.
-- If the output contains ANY real, on-topic information — use 'accept'.
+- Accept partial results — RESULT_EXTRACT will refine them further downstream.
+- Use 'retry_with_refinement' ONLY if the query was completely off-topic or wrong.
+- Use 'reject' ONLY if the output is entirely empty, all mock data, or a tool error.
+- If the output contains ANY real, on-topic information — verdict MUST be 'accept'.
+- The Recommended Action MUST match the verdict exactly:
+    accept               → Recommended Action: proceed
+    retry_with_refinement → Recommended Action: invoke TOOL_REFINE
+    reject               → Recommended Action: escalate to designer
 
 Output Format:
-Relevance Check: <does the output address the subgoal? yes / partial / no>
+Relevance Check: <yes / partial / no>
 Accuracy Assessment: <are the facts real and on-topic?>
 Completeness: <sufficient / partial / insufficient>
 Identified Issues:
-  - <issue 1, if any, or "none">
+  - <issue or "none">
 Overall Verdict: <accept / retry_with_refinement / reject>
 Recommended Action: <proceed / invoke TOOL_REFINE / escalate to designer>""",
 
