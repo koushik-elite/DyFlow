@@ -1,340 +1,332 @@
 #!/usr/bin/env python3
 """
-install_bird.py — Download BIRD (Big Bench for Large-scale Database Grounded
-Text-to-SQL Evaluation) dataset and prepare SQLite databases for DyFlow-T.
+install_bird.py — Download BIRD benchmark and prepare for DyFlow-T evaluation.
 
-Why BIRD over Spider for tool comparison?
-──────────────────────────────────────────
-- Real-world databases with up to 33,000 rows (vs Spider's ~5 rows avg)
-- Dirty/noisy data — LLM cannot guess aggregates by pattern matching
-- Domain-specific values (finance, sports, medical) unknown to parametric LLM
-- Queries require actual execution to get correct numeric answers
-- Official leaderboard metric: Execution Accuracy (EX) + Valid Efficiency Score (VES)
+BIRD (Big Bench for Large-scale Database Grounded Text-to-SQL Evaluation)
+  - Real-world databases with 33k+ rows, dirty data, ambiguous questions
+  - Difficulty: simple / moderate / challenging
+  - Key difference from Spider: LLM cannot guess answers — data is too large
+    and complex. The SQL_QUERY execution tool is essential for correct answers.
 
-This makes BIRD ideal for demonstrating the tool's value:
-the LLM genuinely cannot hallucinate correct COUNT/SUM/AVG answers
-over thousands of realistic rows.
-
-Dataset: https://bird-bench.github.io/
-HuggingFace: https://huggingface.co/datasets/birdbench/bird
+What this does
+──────────────
+1. Downloads BIRD dev split from HuggingFace
+2. Normalises JSON to DyFlow-T format: db_id, question, query, evidence, hardness
+3. Copies .sqlite → .db for consistency with Spider pipeline
+4. Builds a sample finance DB with exchange_rates table (impossible to guess)
 
 Usage
 ─────
-    # Download via HuggingFace (recommended)
-    python scripts/install_bird.py
+    python scripts/install_bird.py              # full download
+    python scripts/install_bird.py --sample-only  # instant offline mode
+    python scripts/install_bird.py --force        # re-download
 
-    # Download via direct URL (alternative)
-    python scripts/install_bird.py --direct
-
-    # Force re-download
-    python scripts/install_bird.py --force
-
-Requirements
-────────────
-    pip install datasets huggingface_hub requests tqdm
-    HF_TOKEN in .env (accept terms at https://huggingface.co/datasets/birdbench/bird)
+Requirements: pip install requests tqdm
 """
 
-import sys
-import os
-import json
-import sqlite3
-import argparse
-import zipfile
-import shutil
-
-REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-DATA_DIR  = os.path.join(REPO_ROOT, "benchmarks", "data", "BIRD")
-DB_ROOT   = os.path.join(DATA_DIR, "databases")
+import sys, os, json, sqlite3, argparse, zipfile, shutil
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 try:
-    from dotenv import load_dotenv
-    load_dotenv(os.path.join(REPO_ROOT, ".env"))
+    import requests
+    from tqdm import tqdm as _tqdm
 except ImportError:
-    pass
+    print("[ERROR] pip install requests tqdm"); sys.exit(1)
+
+REPO_ROOT  = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+DATA_DIR   = os.path.join(REPO_ROOT, "benchmarks", "data", "BIRD")
+DB_ROOT    = os.path.join(DATA_DIR, "databases")
+SAMPLE_DIR = os.path.join(DATA_DIR, "sample")
+
+BIRD_DEV_URL = "https://huggingface.co/datasets/birdsql/bird/resolve/main/dev.zip"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Sample finance database — chosen so LLM CANNOT guess aggregate answers
+# ─────────────────────────────────────────────────────────────────────────────
+
+SAMPLE_SCHEMA = """
+CREATE TABLE IF NOT EXISTS customers (
+    customer_id INTEGER PRIMARY KEY,
+    name        TEXT NOT NULL,
+    country     TEXT NOT NULL,
+    segment     TEXT NOT NULL,   -- Basic / Standard / Premium
+    joined_date TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS products (
+    product_id  INTEGER PRIMARY KEY,
+    name        TEXT NOT NULL,
+    category    TEXT NOT NULL,
+    unit_price  REAL NOT NULL,
+    stock       INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS transactions (
+    transaction_id   INTEGER PRIMARY KEY,
+    customer_id      INTEGER NOT NULL,
+    product_id       INTEGER NOT NULL,
+    amount           REAL    NOT NULL,
+    currency         TEXT    NOT NULL,
+    transaction_date TEXT    NOT NULL,
+    status           TEXT    NOT NULL,  -- completed / failed / refunded
+    region           TEXT    NOT NULL
+);
+CREATE TABLE IF NOT EXISTS exchange_rates (
+    rate_date     TEXT NOT NULL,
+    from_currency TEXT NOT NULL,
+    to_currency   TEXT NOT NULL,
+    rate          REAL NOT NULL,
+    PRIMARY KEY (rate_date, from_currency, to_currency)
+);
+"""
+
+SAMPLE_DATA = """
+INSERT OR IGNORE INTO customers VALUES
+(1,'Alice Chen','US','Premium','2021-03-15'),(2,'Bob Kumar','IN','Standard','2022-07-20'),
+(3,'Carlos Ruiz','MX','Premium','2020-11-05'),(4,'Diana Park','KR','Standard','2023-01-10'),
+(5,'Eve Müller','DE','Premium','2021-09-22'),(6,'Frank Li','CN','Standard','2022-04-18'),
+(7,'Grace Okafor','NG','Basic','2023-06-01'),(8,'Hiro Tanaka','JP','Premium','2020-12-30'),
+(9,'Irina Petrov','RU','Standard','2022-02-14'),(10,'James Smith','US','Basic','2023-08-25');
+
+INSERT OR IGNORE INTO products VALUES
+(1,'Laptop Pro 15','Electronics',1299.99,45),(2,'Wireless Mouse','Electronics',29.99,210),
+(3,'USB-C Hub','Electronics',49.99,180),(4,'Ergonomic Chair','Furniture',399.00,30),
+(5,'Standing Desk','Furniture',649.00,15),(6,'Monitor 27"','Electronics',449.99,60),
+(7,'Mechanical Keyboard','Electronics',129.99,95),(8,'Webcam HD','Electronics',79.99,120),
+(9,'Desk Lamp','Furniture',39.99,200),(10,'Notebook Set','Stationery',12.99,500);
+
+INSERT OR IGNORE INTO transactions VALUES
+(1,1,1,1299.99,'USD','2024-01-05','completed','North America'),
+(2,2,2,29.99,'USD','2024-01-07','completed','Asia'),
+(3,3,3,49.99,'USD','2024-01-09','completed','Latin America'),
+(4,4,6,449.99,'USD','2024-01-12','completed','Asia'),
+(5,5,4,399.00,'EUR','2024-01-15','completed','Europe'),
+(6,6,7,129.99,'USD','2024-01-18','completed','Asia'),
+(7,7,9,39.99,'USD','2024-01-20','failed','Africa'),
+(8,8,1,1299.99,'JPY','2024-01-22','completed','Asia'),
+(9,9,5,649.00,'USD','2024-01-25','refunded','Europe'),
+(10,10,2,29.99,'USD','2024-01-28','completed','North America'),
+(11,1,6,449.99,'USD','2024-02-01','completed','North America'),
+(12,2,7,129.99,'USD','2024-02-03','completed','Asia'),
+(13,3,8,79.99,'USD','2024-02-07','completed','Latin America'),
+(14,4,3,49.99,'USD','2024-02-10','completed','Asia'),
+(15,5,6,449.99,'EUR','2024-02-14','completed','Europe'),
+(16,6,1,1299.99,'USD','2024-02-16','failed','Asia'),
+(17,7,2,29.99,'USD','2024-02-18','completed','Africa'),
+(18,8,4,399.00,'JPY','2024-02-20','completed','Asia'),
+(19,9,7,129.99,'USD','2024-02-22','completed','Europe'),
+(20,10,10,12.99,'USD','2024-02-25','completed','North America'),
+(21,1,3,49.99,'USD','2024-03-01','completed','North America'),
+(22,2,5,649.00,'USD','2024-03-05','completed','Asia'),
+(23,3,1,1299.99,'USD','2024-03-08','refunded','Latin America'),
+(24,4,8,79.99,'USD','2024-03-12','completed','Asia'),
+(25,5,9,39.99,'EUR','2024-03-15','completed','Europe');
+
+INSERT OR IGNORE INTO exchange_rates VALUES
+('2024-01-01','EUR','USD',1.085),('2024-01-01','JPY','USD',0.0067),
+('2024-01-01','USD','EUR',0.922),('2024-02-01','EUR','USD',1.091),
+('2024-02-01','JPY','USD',0.0066),('2024-03-01','EUR','USD',1.088),
+('2024-03-01','JPY','USD',0.0065);
+"""
+
+# Questions where LLM CANNOT guess the answer — must execute SQL to get real value
+SAMPLE_QUESTIONS = [
+    {
+        "db_id":    "finance",
+        "question": "How many transactions were completed in January 2024?",
+        "query":    "SELECT COUNT(*) FROM transactions WHERE status='completed' AND transaction_date LIKE '2024-01%';",
+        "evidence": "Only count rows where status is exactly 'completed'",
+        "hardness": "simple",
+    },
+    {
+        "db_id":    "finance",
+        "question": "What is the total revenue in USD from Electronics products for completed transactions?",
+        "query":    "SELECT ROUND(SUM(t.amount),2) FROM transactions t JOIN products p ON t.product_id=p.product_id WHERE p.category='Electronics' AND t.currency='USD' AND t.status='completed';",
+        "evidence": "Only USD transactions, only completed status",
+        "hardness": "moderate",
+    },
+    {
+        "db_id":    "finance",
+        "question": "Which customer segment has the most failed or refunded transactions?",
+        "query":    "SELECT c.segment, COUNT(*) as cnt FROM transactions t JOIN customers c ON t.customer_id=c.customer_id WHERE t.status IN ('failed','refunded') GROUP BY c.segment ORDER BY cnt DESC LIMIT 1;",
+        "evidence": "failed and refunded are both non-successful outcomes",
+        "hardness": "moderate",
+    },
+    {
+        "db_id":    "finance",
+        "question": "What is the EUR to USD exchange rate on 2024-02-01?",
+        "query":    "SELECT rate FROM exchange_rates WHERE rate_date='2024-02-01' AND from_currency='EUR' AND to_currency='USD';",
+        "evidence": "Look up the exact rate stored in the exchange_rates table",
+        "hardness": "simple",
+    },
+    {
+        "db_id":    "finance",
+        "question": "How many Premium customers made at least one completed transaction in the Asia region?",
+        "query":    "SELECT COUNT(DISTINCT t.customer_id) FROM transactions t JOIN customers c ON t.customer_id=c.customer_id WHERE c.segment='Premium' AND t.region='Asia' AND t.status='completed';",
+        "evidence": "Count each customer once even if they made multiple transactions",
+        "hardness": "challenging",
+    },
+    {
+        "db_id":    "finance",
+        "question": "Which products have never appeared in a failed transaction?",
+        "query":    "SELECT name FROM products WHERE product_id NOT IN (SELECT DISTINCT product_id FROM transactions WHERE status='failed');",
+        "evidence": "Products with zero failed transactions in the entire history",
+        "hardness": "challenging",
+    },
+    {
+        "db_id":    "finance",
+        "question": "What is the average transaction amount per region for February 2024 completed sales?",
+        "query":    "SELECT region, ROUND(AVG(amount),2) as avg_amount FROM transactions WHERE transaction_date LIKE '2024-02%' AND status='completed' GROUP BY region ORDER BY avg_amount DESC;",
+        "evidence": "Only completed transactions in February 2024, round to 2 decimal places",
+        "hardness": "moderate",
+    },
+    {
+        "db_id":    "finance",
+        "question": "List the top 3 customers by total completed transaction amount.",
+        "query":    "SELECT c.name, ROUND(SUM(t.amount),2) as total FROM transactions t JOIN customers c ON t.customer_id=c.customer_id WHERE t.status='completed' GROUP BY t.customer_id ORDER BY total DESC LIMIT 3;",
+        "evidence": "Sum all completed transactions per customer",
+        "hardness": "moderate",
+    },
+]
 
 
-# ── BIRD format normalisation ─────────────────────────────────────────────────
+def build_sample_db(force: bool = False) -> None:
+    os.makedirs(SAMPLE_DIR, exist_ok=True)
+    db_dir  = os.path.join(SAMPLE_DIR, "finance")
+    os.makedirs(db_dir, exist_ok=True)
+    db_path = os.path.join(db_dir, "finance.db")
 
-def normalise_bird_record(row: dict) -> dict:
-    """
-    Map BIRD JSON fields → DyFlow-T SpiderBenchmark format.
+    if os.path.exists(db_path) and not force:
+        print(f"[sample] Already exists: {db_path}")
+    else:
+        print("[sample] Building finance database...")
+        conn = sqlite3.connect(db_path)
+        conn.executescript(SAMPLE_SCHEMA)
+        conn.executescript(SAMPLE_DATA)
+        conn.commit()
+        conn.close()
+        # Verify row counts
+        conn = sqlite3.connect(db_path)
+        for tbl in ("customers","products","transactions","exchange_rates"):
+            n = conn.execute(f"SELECT COUNT(*) FROM {tbl}").fetchone()[0]
+            print(f"  {tbl}: {n} rows")
+        conn.close()
+        print(f"[sample] Created: {db_path}")
 
-    BIRD dev fields:
-        question, SQL, db_id, difficulty, evidence (extra domain hint)
-    """
-    return {
-        "db_id":    row.get("db_id", ""),
-        "question": row.get("question", ""),
-        "query":    row.get("SQL", row.get("query", row.get("sql", ""))),
-        "hardness": row.get("difficulty", row.get("hardness", "unknown")),
-        "evidence": row.get("evidence", ""),   # domain hint unique to BIRD
-    }
-
-
-# ── Download via HuggingFace datasets ────────────────────────────────────────
-
-def download_via_huggingface(force: bool = False) -> bool:
-    """Download BIRD via HuggingFace datasets library."""
-    try:
-        from datasets import load_dataset
-        from huggingface_hub import login
-    except ImportError:
-        print("[ERROR] Missing packages: pip install datasets huggingface_hub")
-        return False
-
-    hf_token = os.getenv("HF_TOKEN", "")
-    if hf_token:
-        try:
-            login(token=hf_token, add_to_git_credential=False)
-            print("[HF] Logged in with HF_TOKEN")
-        except Exception as e:
-            print(f"[HF] Login warning: {e}")
-
-    dev_path   = os.path.join(DATA_DIR, "bird_dev.json")
-    train_path = os.path.join(DATA_DIR, "bird_train.json")
-
-    if os.path.exists(dev_path) and not force:
-        print(f"[BIRD] Already downloaded: {dev_path}")
-        return True
-
-    print("[BIRD] Downloading via HuggingFace...")
-    try:
-        dataset = load_dataset("birdbench/bird", trust_remote_code=True)
-    except Exception as e:
-        print(f"[ERROR] HuggingFace download failed: {e}")
-        print("  → Try: python scripts/install_bird.py --direct")
-        return False
-
-    os.makedirs(DATA_DIR, exist_ok=True)
-
-    for split_name, out_path in [("validation", dev_path), ("train", train_path)]:
-        if split_name not in dataset:
-            print(f"  [skip] Split '{split_name}' not found")
-            continue
-        records = [normalise_bird_record(dict(r)) for r in dataset[split_name]]
-        with open(out_path, "w", encoding="utf-8") as f:
-            json.dump(records, f, indent=2, ensure_ascii=False)
-        _print_split_stats(out_path, records)
-
-    return True
+    q_path = os.path.join(SAMPLE_DIR, "bird_sample.json")
+    with open(q_path, "w", encoding="utf-8") as f:
+        json.dump(SAMPLE_QUESTIONS, f, indent=2, ensure_ascii=False)
+    print(f"[sample] Questions: {q_path}  ({len(SAMPLE_QUESTIONS)} questions)")
 
 
-def _print_split_stats(path: str, records: list):
-    counts = {}
-    for r in records:
-        h = r.get("hardness", "unknown")
-        counts[h] = counts.get(h, 0) + 1
-    print(f"  ✅  {os.path.basename(path)}: {len(records)} records")
-    for h in ["simple", "moderate", "challenging", "unknown"]:
-        if h in counts:
-            print(f"       {h}: {counts[h]}")
+def download_file(url: str, dest: str) -> None:
+    print(f"[download] {url}")
+    r = requests.get(url, stream=True, timeout=180)
+    r.raise_for_status()
+    total = int(r.headers.get("content-length", 0))
+    with open(dest, "wb") as f, _tqdm(total=total, unit="B", unit_scale=True) as bar:
+        for chunk in r.iter_content(65536):
+            f.write(chunk); bar.update(len(chunk))
 
 
-# ── Download via direct URL ───────────────────────────────────────────────────
-
-BIRD_DIRECT_URL = (
-    "https://bird-bench.oss-cn-beijing.aliyuncs.com/dev.zip"
-)
-
-def download_via_direct(force: bool = False) -> bool:
-    """Download BIRD dev set via direct URL (no HF token needed)."""
-    try:
-        import requests
-        from tqdm import tqdm as _tqdm
-    except ImportError:
-        print("[ERROR] Missing: pip install requests tqdm")
-        return False
-
-    extract_dir = os.path.join(DATA_DIR, "_bird_extracted")
-    zip_path    = os.path.join(DATA_DIR, "bird_dev.zip")
-
-    if os.path.exists(extract_dir) and not force:
-        print(f"[BIRD] Already extracted: {extract_dir}")
-        return _process_direct_download(extract_dir)
-
-    print(f"[BIRD] Downloading dev set from {BIRD_DIRECT_URL}")
-    print("       (~1.5 GB — includes databases with real data rows)\n")
-
-    try:
-        os.makedirs(DATA_DIR, exist_ok=True)
-        response = requests.get(BIRD_DIRECT_URL, stream=True, timeout=300)
-        response.raise_for_status()
-        total = int(response.headers.get("content-length", 0))
-
-        with open(zip_path, "wb") as f, _tqdm(
-            total=total, unit="B", unit_scale=True, desc="Downloading"
-        ) as bar:
-            for chunk in response.iter_content(chunk_size=65536):
-                f.write(chunk)
-                bar.update(len(chunk))
-
-        print("\n[BIRD] Extracting...")
-        os.makedirs(extract_dir, exist_ok=True)
-        with zipfile.ZipFile(zip_path, "r") as z:
-            z.extractall(extract_dir)
-        os.remove(zip_path)
-        print(f"[BIRD] Extracted to {extract_dir}")
-
-    except Exception as e:
-        print(f"[ERROR] Direct download failed: {e}")
-        print("\nManual download instructions:")
-        print("  1. Visit https://bird-bench.github.io/")
-        print("  2. Download dev.zip")
-        print(f"  3. Extract to: {extract_dir}")
-        return False
-
-    return _process_direct_download(extract_dir)
+def extract_zip(zip_path: str, dest: str) -> str:
+    print(f"[extract] → {dest}")
+    os.makedirs(dest, exist_ok=True)
+    with zipfile.ZipFile(zip_path) as z:
+        z.extractall(dest)
+    dirs = [os.path.join(dest,d) for d in os.listdir(dest) if os.path.isdir(os.path.join(dest,d))]
+    return dirs[0] if dirs else dest
 
 
-def _process_direct_download(extract_dir: str) -> bool:
-    """Process extracted BIRD zip — copy DBs and normalise JSON."""
-    # Find the JSON file
-    dev_json = None
-    for root, _, files in os.walk(extract_dir):
-        for f in files:
-            if f in ("dev.json", "dev_20240627.json"):
-                dev_json = os.path.join(root, f)
-                break
-        if dev_json:
-            break
-
-    if not dev_json:
-        print("[ERROR] Could not find dev.json in extracted files")
-        print(f"  Contents: {os.listdir(extract_dir)}")
-        return False
-
-    with open(dev_json, "r", encoding="utf-8") as f:
+def normalise_bird_json(src: str, dst: str) -> int:
+    """BIRD 'SQL' + 'difficulty' → DyFlow-T 'query' + 'hardness'."""
+    with open(src, encoding="utf-8") as f:
         raw = json.load(f)
+    items = raw if isinstance(raw, list) else raw.get("data", list(raw.values())[0])
+    out = [
+        {
+            "db_id":    r.get("db_id",""),
+            "question": r.get("question",""),
+            "query":    r.get("SQL", r.get("query","")),
+            "evidence": r.get("evidence",""),
+            "hardness": r.get("difficulty", r.get("hardness","unknown")),
+        }
+        for r in items
+    ]
+    with open(dst, "w", encoding="utf-8") as f:
+        json.dump(out, f, indent=2, ensure_ascii=False)
+    return len(out)
 
-    records = [normalise_bird_record(r) for r in raw]
-    out_path = os.path.join(DATA_DIR, "bird_dev.json")
-    with open(out_path, "w", encoding="utf-8") as f:
-        json.dump(records, f, indent=2, ensure_ascii=False)
-    _print_split_stats(out_path, records)
 
-    # Copy databases
-    _copy_bird_databases(extract_dir)
-    return True
+def copy_databases(src_dir: str, dest_dir: str, force: bool = False) -> int:
+    """Copy BIRD .sqlite → .db, preserving db_id/db_id.db layout."""
+    os.makedirs(dest_dir, exist_ok=True)
+    copied = 0
+    for root, _, files in os.walk(src_dir):
+        for fname in files:
+            if fname.endswith((".sqlite", ".db")):
+                db_id     = os.path.splitext(fname)[0]
+                out_dir   = os.path.join(dest_dir, db_id)
+                os.makedirs(out_dir, exist_ok=True)
+                dest_path = os.path.join(out_dir, f"{db_id}.db")
+                if not os.path.exists(dest_path) or force:
+                    shutil.copy2(os.path.join(root, fname), dest_path)
+                    copied += 1
+    return copied
 
 
-# ── Copy/link BIRD databases ──────────────────────────────────────────────────
-
-def _copy_bird_databases(extract_dir: str):
-    """
-    BIRD ships pre-built SQLite .sqlite files — just copy them into
-    our databases/<db_id>/<db_id>.db structure.
-    """
+def main(args) -> None:
+    os.makedirs(DATA_DIR, exist_ok=True)
     os.makedirs(DB_ROOT, exist_ok=True)
 
-    # Find all .sqlite / .db files in the extracted dir
-    db_files = []
-    for root, _, files in os.walk(extract_dir):
-        for f in files:
-            if f.endswith((".sqlite", ".db", ".sqlite3")):
-                db_files.append(os.path.join(root, f))
+    print("=" * 60)
+    print("BIRD Dataset Installer")
+    print("=" * 60)
 
-    if not db_files:
-        print("[BIRD] ⚠️  No SQLite database files found in extracted archive.")
-        print("        The databases may be in a separate download.")
-        print("        See https://bird-bench.github.io/ for the database pack.")
+    print("\n[1/3] Building sample finance database...")
+    build_sample_db(force=args.force)
+
+    if args.sample_only:
+        print("\n✅  Sample ready (offline mode).")
+        print("    python scripts/compare_bird.py --sample")
         return
 
-    print(f"\n[BIRD] Copying {len(db_files)} databases...")
-    copied = 0
-    for src in db_files:
-        db_id = os.path.splitext(os.path.basename(src))[0]
-        out_dir = os.path.join(DB_ROOT, db_id)
-        out_path = os.path.join(out_dir, f"{db_id}.db")
-        os.makedirs(out_dir, exist_ok=True)
-        if not os.path.exists(out_path):
-            shutil.copy2(src, out_path)
-            copied += 1
+    print("\n[2/3] Downloading BIRD dev split...")
+    tmp = os.path.join(DATA_DIR, "_extracted")
+    os.makedirs(tmp, exist_ok=True)
+    dev_zip = os.path.join(tmp, "bird_dev.zip")
+    if not os.path.exists(dev_zip) or args.force:
+        try:
+            download_file(BIRD_DEV_URL, dev_zip)
+        except Exception as e:
+            print(f"[ERROR] {e}")
+            print("  Manual: https://huggingface.co/datasets/birdsql/bird")
+            sys.exit(1)
 
-    print(f"  ✅  Copied {copied} databases to {DB_ROOT}")
+    dev_dir = extract_zip(dev_zip, os.path.join(tmp, "dev"))
 
+    # Find the dev JSON file
+    for root, _, files in os.walk(dev_dir):
+        for f in files:
+            if f.endswith(".json") and "dev" in f.lower():
+                src  = os.path.join(root, f)
+                dst  = os.path.join(DATA_DIR, "bird_dev.json")
+                n    = normalise_bird_json(src, dst)
+                print(f"[normalise] {n} questions → {dst}")
+                break
 
-# ── Verify ────────────────────────────────────────────────────────────────────
-
-def verify_bird():
-    print("\n[Verify] BIRD setup...")
-    dev_path = os.path.join(DATA_DIR, "bird_dev.json")
-    all_ok = True
-
-    if not os.path.exists(dev_path):
-        print(f"  [FAIL] dev JSON not found: {dev_path}")
-        all_ok = False
-    else:
-        with open(dev_path) as f:
-            records = json.load(f)
-        print(f"  [OK]   bird_dev.json: {len(records)} records")
-
-    db_count = 0
-    if os.path.isdir(DB_ROOT):
-        for db_id in os.listdir(DB_ROOT):
-            db_path = os.path.join(DB_ROOT, db_id, f"{db_id}.db")
-            if os.path.exists(db_path):
-                db_count += 1
-    print(f"  [{'OK' if db_count > 0 else 'WARN'}]   Databases found: {db_count}")
-
-    if db_count == 0:
-        print("  ⚠️   No databases found. BIRD databases may need separate download.")
-        print("       See: https://bird-bench.github.io/")
-
-    return all_ok
-
-
-# ── Main ──────────────────────────────────────────────────────────────────────
-
-def main(args):
-    print("=" * 60)
-    print("BIRD Dataset Installer for DyFlow-T")
-    print("=" * 60)
-    print("\nWhy BIRD for tool comparison:")
-    print("  • Real databases with up to 33,000 rows")
-    print("  • LLM cannot guess COUNT/SUM/AVG over real noisy data")
-    print("  • Proves tool execution value over LLM hallucination")
-    print()
-
-    os.makedirs(DATA_DIR, exist_ok=True)
-    os.makedirs(DB_ROOT,  exist_ok=True)
-
-    if args.direct:
-        success = download_via_direct(force=args.force)
-    else:
-        success = download_via_huggingface(force=args.force)
-        if not success:
-            print("\n[Fallback] Trying direct URL download...")
-            success = download_via_direct(force=args.force)
-
-    verify_bird()
+    print("\n[3/3] Copying databases...")
+    n = copy_databases(dev_dir, DB_ROOT, force=args.force)
+    print(f"[databases] {n} databases → {DB_ROOT}")
 
     print("\n" + "=" * 60)
-    if success:
-        print("✅  BIRD dataset ready!")
-        print(f"    Dev JSON:  {os.path.join(DATA_DIR, 'bird_dev.json')}")
-        print(f"    Databases: {DB_ROOT}")
-        print("\nRun comparison:")
-        print("    python scripts/compare_spider.py --dataset bird --mode dev --size 50 --workers 3")
-        print("\nRun evaluation only:")
-        print("    python scripts/run_spider.py --dataset bird --mode dev --size 50")
-    else:
-        print("⚠️   Download incomplete — check errors above.")
-        print("     Manual download: https://bird-bench.github.io/")
+    print("✅  BIRD ready!")
+    print(f"    Dev JSON:  {os.path.join(DATA_DIR, 'bird_dev.json')}")
+    print("\nRun comparison:")
+    print("    python scripts/compare_bird.py --mode dev --size 50 --workers 3")
     print("=" * 60)
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="Download BIRD dataset for DyFlow-T SQL tool comparison"
-    )
-    parser.add_argument(
-        "--direct", action="store_true",
-        help="Download via direct URL instead of HuggingFace (no token needed)",
-    )
-    parser.add_argument(
-        "--force", action="store_true",
-        help="Re-download even if files already exist",
-    )
-    args = parser.parse_args()
-    main(args)
+    p = argparse.ArgumentParser()
+    p.add_argument("--sample-only", action="store_true")
+    p.add_argument("--force", action="store_true")
+    main(p.parse_args())
