@@ -28,12 +28,14 @@ def build_tool_registry() -> ToolRegistry:
     registry = ToolRegistry()
 
     # ── Web Search ────────────────────────────────────────────────────────────
-    serpapi_key = os.getenv("SERPAPI_API_KEY", "")
+    # Support both SERPAPI_API_KEY (new) and SERPER_API_KEY (legacy) env var names
+    serpapi_key = os.getenv("SERPAPI_API_KEY", "") or os.getenv("SERPER_API_KEY", "")
     if serpapi_key:
-        print("[Tools] WebSearchTool → live (Serper API)")
+        print(f"[Tools] WebSearchTool → live (SerpAPI) key=...{serpapi_key[-6:]}")
         registry.register("WEB_SEARCH", WebSearchTool(api_key=serpapi_key))
     else:
-        print("[Tools] WebSearchTool → mock (set SERPAPI_API_KEY for live search)")
+        print("[Tools] WebSearchTool → mock")
+        print("[Tools]   ⚠  Set SERPAPI_API_KEY in your .env for live search")
         registry.register("WEB_SEARCH", MockWebSearchTool())
 
     # ── SQL Query ─────────────────────────────────────────────────────────────

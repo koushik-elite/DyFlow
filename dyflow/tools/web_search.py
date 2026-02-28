@@ -74,11 +74,18 @@ class WebSearchTool(BaseTool):
     tool_name = "WEB_SEARCH"
 
     def __init__(self, api_key: Optional[str] = None, top_k: int = 5) -> None:
-        self.api_key   = api_key or os.getenv("SERPAPI_API_KEY", "")
+        # Support both old (SERPER_API_KEY) and new (SERPAPI_API_KEY) env var names
+        self.api_key = (
+            api_key
+            or os.getenv("SERPAPI_API_KEY", "")
+            or os.getenv("SERPER_API_KEY", "")   # backward compat
+        )
         self.default_k = top_k
 
     def execute(self, params: Dict[str, Any]) -> ToolResult:
         query = params.get("query", "").strip()
+        # Strip backticks the LLM sometimes wraps around the query
+        query = query.strip("`").strip()
         top_k = int(params.get("top_k", self.default_k))
 
         if not query:

@@ -394,7 +394,7 @@ class ToolExecutorOperator(Operator):
                 content = val.get("content", "")
                 match   = re.search(r"Primary Query\s*:\s*(.+?)(?:\n|$)", content, re.IGNORECASE)
                 if match:
-                    return match.group(1).strip()
+                    return match.group(1).strip().strip("`")
         return None
 
     def _find_refined_query(self, state: State) -> Optional[str]:
