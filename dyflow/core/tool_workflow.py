@@ -108,20 +108,23 @@ Current Execution Summary:
     Use when: the subgoal requires external factual knowledge and the query needs refinement.
     Output: formulated_query_{{id}}
 
-12. WEB_SEARCH         — Retrieve and summarise information from the web.
-    Use when: the task requires up-to-date factual knowledge beyond the model's parametric memory.
+12. WEB_SEARCH         — Retrieve REAL current information from the web.
+    PURPOSE: The tool fetches actual web content — not LLM memory or assumptions.
+    Use when: the task requires current facts the LLM cannot know (prices, dates, live data).
     Always pair with: SEARCH_QUERY_FORMULATE → WEB_SEARCH → TOOL_REVIEW → RESULT_EXTRACT
     Output: search_result_{{id}}
 
-13. SQL_GENERATE       — Write a precise SQLite SELECT query for the given schema and question.
-    Use when: BEFORE every SQL_QUERY — this generates the SQL the tool will execute.
+13. SQL_GENERATE       — Write a precise SQLite SELECT query (LLM reasoning step).
+    PURPOSE: Both DyFlow and DyFlow-T can generate SQL — this is pure LLM reasoning.
+    Use when: BEFORE every SQL_QUERY — generates the SQL statement to be executed.
     Output key must contain "sql_generate" (e.g. "sql_generate_{{id}}")
-    Input keys: ["schema", "question"] or ["original_problem"]
+    Input keys: ["schema", "question"]
 
-14. SQL_QUERY          — Execute a SQL query against the database.
-    Use when: the task involves structured data retrieval, aggregation, or filtering.
+14. SQL_QUERY          — EXECUTE the SQL against the real database and return actual rows.
+    PURPOSE: This is the key differentiator — the tool runs the SQL and returns REAL data.
+    Without this tool, the LLM must guess what rows the query would return (unreliable).
+    With this tool, actual database rows are returned — ground truth for any question.
     ALWAYS pair with: SQL_GENERATE → SQL_QUERY → TOOL_REVIEW → RESULT_EXTRACT
-    The SQL_QUERY operator reads the SQL from the SQL_GENERATE output automatically.
     Output: sql_result_{{id}}
 
 15. TOOL_REVIEW        — Audit tool output quality and relevance.
@@ -133,14 +136,14 @@ Current Execution Summary:
     Use when: TOOL_REVIEW verdict is 'retry_with_refinement'.
     Output: tool_refined_result_{{id}}
 
-17. RESULT_EXTRACT     — Distil raw tool output into clean memory buffer entries.
+17. RESULT_EXTRACT     — Distil real tool output into a clean final answer.
     Use when: after TOOL_REVIEW verdict is 'accept', before ORGANIZE_SOLUTION.
+    For SQL: reads the actual returned rows and extracts the direct answer.
     Output: extracted_result_{{id}}
 
 # Design Rules
 
 1. Stage Structure:
-   - Typical stage: 3–4 operators working together to achieve an intermediate goal
    - Web search pattern: SEARCH_QUERY_FORMULATE → WEB_SEARCH → TOOL_REVIEW → RESULT_EXTRACT
    - SQL pattern: SQL_GENERATE → SQL_QUERY → TOOL_REVIEW → RESULT_EXTRACT
    - Termination stage: ONLY ORGANIZE_SOLUTION — never mix with other operators
@@ -152,15 +155,15 @@ Current Execution Summary:
    - Output keys: Use exact keys from the summary; never invent new ones
 
 3. Input Keys:
-   - Always reference existing output_key names from the summary
-   - For SQL_GENERATE: use input_keys ["schema", "question"] — these are pre-seeded from the problem
-   - For SQL_QUERY: no explicit input_keys needed — it reads SQL_GENERATE output automatically
+   - SQL_GENERATE: use input_keys ["schema", "question"] — pre-seeded from problem description
+   - SQL_QUERY: no explicit input_keys needed — reads SQL_GENERATE output automatically
+   - RESULT_EXTRACT: include the sql_result or search_result key from the tool output
    - For any reasoning operator needing the problem: include "original_problem" in input_keys
 
 4. Tool Selection Guidelines:
-   - If a question requires recent/external facts → use WEB_SEARCH chain
-   - If a question involves structured data/tables → use SQL_GENERATE → SQL_QUERY chain
-   - If a question is self-contained and logical → use pure reasoning operators
+   - Structured data question (counts, joins, aggregates) → SQL_GENERATE → SQL_QUERY chain
+   - Current/external facts (prices, recent events, live data) → WEB_SEARCH chain
+   - Self-contained logical reasoning → pure reasoning operators (no tools needed)
    - Never use WEB_SEARCH and SQL_QUERY in the same stage
 
 Output Format:

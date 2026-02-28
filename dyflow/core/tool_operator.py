@@ -63,14 +63,13 @@ Alternative Queries:
 Rationale: <one sentence explaining why this query best targets the subgoal>""",
 
     # ── SQL_GENERATE ──────────────────────────────────────────────────────────
+    # This is a pure LLM reasoning step — both DyFlow and DyFlow-T can do this.
+    # The DIFFERENTIATOR is SQL_QUERY which EXECUTES the SQL and returns real rows.
     "SQL_GENERATE": """You are an expert SQLite SQL engineer. Generate a precise SQL SELECT query
 to answer the natural language question using the provided schema.
 
-Context:
-{context}
-
-Guidance:
-{guidance}
+IMPORTANT: This SQL will be EXECUTED against a real SQLite database.
+You must write syntactically correct SQL — errors mean no data is retrieved.
 
 Database Schema:
 {schema}
@@ -78,13 +77,16 @@ Database Schema:
 Question:
 {question}
 
+Context:
+{context}
+
 Rules:
 - Write valid SQLite syntax only.
 - Use only tables and columns that exist in the schema above.
 - Prefer explicit column names over SELECT *.
 - Use JOINs when data spans multiple tables.
 - Use GROUP BY with aggregates (COUNT, SUM, AVG, MAX, MIN).
-- Use subqueries or CTEs for complex logic.
+- Use subqueries or CTEs for complex multi-step logic.
 - Do NOT include any explanation — output the SQL query only.
 - Do NOT wrap in markdown fences.
 
@@ -123,9 +125,11 @@ Confidence: <high / medium / low>
 Gaps: <any missing information or ambiguity noted>""",
 
     # ── SQL_QUERY ─────────────────────────────────────────────────────────────
-    # Template used to FORMAT the SQL result for memory storage
-    "SQL_QUERY": """You are an expert SQL engineer capable of generating precise SQL queries
-and interpreting database results.
+    # This template interprets REAL EXECUTED rows from the SQLite tool.
+    # The tool already ran the SQL — the LLM's job here is ONLY to interpret
+    # the actual returned rows, NOT to guess or assume what the result would be.
+    "SQL_QUERY": """You are interpreting the REAL results of a SQL query that was executed
+against a live SQLite database. These are actual database rows — not estimates.
 
 Context:
 {context}
@@ -139,22 +143,23 @@ Database Schema:
 SQL Query Executed:
 {sql_query}
 
-Execution Result:
+ACTUAL Execution Result (real rows from database):
 {tool_output}
 
 Instructions:
-- Interpret the result set in plain language relevant to the current subgoal.
-- Highlight key rows, aggregates, or patterns in the returned data.
-- If the query returned an error, describe the likely cause clearly.
-- If 0 rows were returned, assess whether this is expected or signals a problem.
+- Interpret ONLY what the actual returned rows say — do not assume or hallucinate.
+- If the result is a single number (COUNT, SUM, AVG), state it directly.
+- If the result is a list of rows, summarise what they contain.
+- If 0 rows returned, state clearly: "The query returned no results."
+- If there was an error, describe it — do NOT invent a result.
+- The answer must come directly from the rows above, nothing else.
 
 Output Format:
-SQL Generated:
-  <sql query here>
-Execution Status: <success / error / empty>
-Result Summary: <natural language interpretation of the returned rows>
-Row Count: <number of rows returned>
-Error Details: <if applicable>""",
+SQL Executed: <the sql that ran>
+Row Count: <exact number of rows returned>
+Execution Status: <success / empty / error>
+Result Interpretation: <plain English interpretation of the actual rows>
+Final Answer: <the direct answer to the question based solely on the real rows above>""",
 
     # ── TOOL_REVIEW ───────────────────────────────────────────────────────────
     "TOOL_REVIEW": """You are a pragmatic reviewer of tool outputs. Your role is to
@@ -235,8 +240,7 @@ Resolution Status: <resolved / partially_resolved / unresolved>
 Next Action: <proceed / escalate to designer>""",
 
     # ── RESULT_EXTRACT ────────────────────────────────────────────────────────
-    "RESULT_EXTRACT": """You are an expert at distilling raw tool outputs into clean, structured information
-that can be directly used by downstream reasoning steps.
+    "RESULT_EXTRACT": """You are extracting the final answer from tool execution results.
 
 Context:
 {context}
@@ -250,23 +254,30 @@ Raw Tool Output:
 
 Target Subgoal: {subgoal_description}
 
-Instructions:
-- Extract only information that is directly relevant to the stated subgoal.
-- Remove duplicates, advertisements, navigation text, and irrelevant metadata.
-- Resolve minor contradictions across sources by noting the most reliable reference.
-- Structure extracted information as typed key-value entries.
-- Preserve source attribution for each extracted fact (URL or table name).
-- If no relevant information can be extracted, state this explicitly.
-- The Final Answer field MUST be a concise direct answer to the original problem (1-2 sentences max).
+Instructions (apply based on source tool):
+
+If source tool is SQL_QUERY (database execution):
+  - The rows above are REAL data from the database — treat them as ground truth.
+  - Extract the answer directly from the Row Count and Result Interpretation fields.
+  - Do NOT reason about what the answer "should" be — read it from the actual rows.
+  - A COUNT of 2 means the answer is 2. A SUM of 450.5 means the answer is 450.5.
+
+If source tool is WEB_SEARCH (web retrieval):
+  - Extract only facts explicitly stated in the retrieved snippets.
+  - Do NOT hallucinate or infer beyond what the results explicitly state.
+  - Note the source URL for each extracted fact.
+
+General rules:
+  - If no relevant information can be extracted, state this explicitly.
+  - The Final Answer MUST be a direct, concise answer (a number, name, list, or short phrase).
+  - Do NOT pad with explanation — the answer should be copy-pasteable as-is.
 
 Output Format:
 Extracted Facts:
-  <key_1>: <value_1>  [source: <ref>]
-  <key_2>: <value_2>  [source: <ref>]
-Summary: <2–3 sentence synthesis of the extracted content>
+  <key>: <value>  [source: <table or URL>]
+Summary: <1-2 sentence synthesis>
 Extraction Confidence: <high / medium / low>
-Unresolved Conflicts: <any contradictory facts noted>
-Final Answer: <concise direct answer to the original problem — this is the most important field>""",
+Final Answer: <the direct answer — number, name, or short phrase>""",
 }
 
 
@@ -612,6 +623,7 @@ class ToolAwareLLMOperator(Operator):
         """
         Find the most recent ToolResult in state.tool_results that matches
         one of the input_keys, and extract fields for prompt injection.
+        Also injects the SQL generated by SQL_GENERATE into {sql_query}.
         """
         fields: Dict[str, str] = {}
         tool_results = getattr(state, "tool_results", {})
@@ -624,7 +636,29 @@ class ToolAwareLLMOperator(Operator):
                 fields["tool_operator_name"] = tr.tool_name
                 fields["tool_input"]         = tr.query
                 fields["original_tool_input"]= tr.query
+                # For SQL_QUERY: expose the actual query that was executed
+                fields["sql_query"]          = tr.query
                 break
+
+        # If no tool result matched, still try to surface the most recent one
+        if "tool_output" not in fields and tool_results:
+            tr = list(tool_results.values())[-1]
+            fields["tool_output"]        = tr.raw_output
+            fields["tool_operator_name"] = tr.tool_name
+            fields["tool_input"]         = tr.query
+            fields["sql_query"]          = tr.query
+
+        # Inject SQL from SQL_GENERATE output into {sql_query} placeholder
+        # so the SQL_QUERY interpretation template can show what query ran
+        if "sql_query" not in fields or not fields["sql_query"]:
+            for key, val in state.actions.items():
+                if any(tok in key.lower() for tok in ("sql_generate", "generated_sql")):
+                    content = val.get("content", "")
+                    match = re.search(r"SQL\s*:\s*(SELECT.+?)(?:;?\s*$)", content,
+                                      re.IGNORECASE | re.DOTALL)
+                    if match:
+                        fields["sql_query"] = match.group(1).strip()
+                        break
 
         # Parse TOOL_REVIEW verdict from memory for TOOL_REFINE
         for key, val in state.actions.items():
@@ -633,7 +667,6 @@ class ToolAwareLLMOperator(Operator):
                 verdict = parse_tool_review_verdict(content)
                 if verdict != "unknown":
                     fields["tool_review_verdict"] = verdict
-                    # Extract issues section
                     issues_match = re.search(
                         r"Identified Issues\s*:(.*?)(?:Overall Verdict|$)",
                         content, re.IGNORECASE | re.DOTALL
