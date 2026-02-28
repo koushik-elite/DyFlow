@@ -210,12 +210,23 @@ class ToolAwareWorkflowExecutor:
             operators  = stage_json.get("operators", [])
             terminated = False
 
+            # Register stage so InstructExecutorOperator can log history to it
+            if stage_id not in self.state.stages:
+                self.state.stages[stage_id] = {
+                    "description": stage_json.get("stage_description", ""),
+                    "status": "executing",
+                    "history": [],
+                }
+
             # 2. Execute each operator in the stage
             for op_def in operators:
                 op_id   = op_def.get("operator_id", "op_unknown")
                 op_desc = op_def.get("operator_description", "")
                 params  = op_def.get("params", {})
                 instr   = params.get("instruction_type", "").upper()
+
+                # Required by InstructExecutorOperator to log into stage history
+                params["target_stage_id"] = stage_id
 
                 print(f"  [{op_id}] {instr}: {op_desc[:60]}")
 

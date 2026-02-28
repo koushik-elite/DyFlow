@@ -513,7 +513,7 @@ class ToolAwareLLMOperator(Operator):
     def _build_context(
         self, state: State, resolved: Dict[str, str], input_keys: List[str]
     ) -> str:
-        parts = [f"Problem: {state.problem_description}"]
+        parts = [f"Problem: {state.original_problem}"]
         for key in input_keys:
             if key in resolved and resolved[key]:
                 parts.append(f"[{key}]:\n{resolved[key]}")
