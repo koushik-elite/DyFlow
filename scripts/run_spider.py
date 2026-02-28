@@ -155,7 +155,6 @@ def run_sample(args):
     benchmark.dataset_path = sample_json
 
     # Override output paths to sample results
-    import os
     results_dir = os.path.join(REPO_ROOT, "benchmarks", "results", "Spider", "sample")
     os.makedirs(results_dir, exist_ok=True)
     benchmark.output_path  = os.path.join(results_dir, "DyFlow-T-sample_gemini-2.5-flash.json")
