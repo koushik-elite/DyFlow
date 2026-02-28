@@ -58,3 +58,9 @@ htmlcov/
 # Temporary files
 *.tmp
 temp/
+
+# Benchmark datasets (downloaded locally, not committed)
+benchmarks/data/Spider/sample
+benchmarks/data/Spider/databases
+benchmarks/data/Spider/_spider_extracted
+benchmarks/data/GAIA/GAIA_*.json
