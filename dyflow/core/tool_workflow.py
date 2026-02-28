@@ -384,9 +384,9 @@ class ToolAwareWorkflowExecutor:
 
         if verdict == "retry_with_refinement":
             self._run_tool_refine_inline(review_op_id, review_params)
-
         elif verdict == "reject":
             logger.warning(f"[TOOL_REVIEW] verdict=reject | escalating to designer replan")
+        # accept (or defaulted to accept) — continue normally
 
         return "next"
 

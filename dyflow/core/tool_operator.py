@@ -236,13 +236,36 @@ def parse_tool_review_verdict(review_text: str) -> str:
     """
     Extracts the 'Overall Verdict' from a TOOL_REVIEW output string.
 
-    Returns one of: 'accept', 'retry_with_refinement', 'reject', 'unknown'.
+    Returns one of: 'accept', 'retry_with_refinement', 'reject'.
+    Defaults to 'accept' if no clear verdict is found, so the
+    workflow always moves forward rather than stalling on ambiguity.
     """
-    pattern = r"Overall Verdict\s*:\s*(accept|retry_with_refinement|reject)"
+    if not review_text:
+        return "accept"
+
+    # 1. Try to find explicit 'Overall Verdict: <value>' line
+    pattern = r"Overall Verdict\s*[:\-]\s*\*{0,2}(accept|retry_with_refinement|reject)\*{0,2}"
     match = re.search(pattern, review_text, re.IGNORECASE)
     if match:
         return match.group(1).lower()
-    return "unknown"
+
+    # 2. Scan anywhere in text for the verdict keywords
+    text_lower = review_text.lower()
+
+    # Check reject first (most specific — prevents false accept on "not reject")
+    if re.search(r"\breject\b", text_lower):
+        # Only treat as reject if there's no 'accept' that overrides it
+        if not re.search(r"\baccept\b", text_lower):
+            return "reject"
+
+    if re.search(r"\bretry_with_refinement\b|\bretry with refinement\b", text_lower):
+        return "retry_with_refinement"
+
+    if re.search(r"\baccept\b", text_lower):
+        return "accept"
+
+    # 3. Default to accept — partial results should flow forward
+    return "accept"
 
 
 def parse_refined_query(refine_text: str) -> Optional[str]:
