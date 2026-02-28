@@ -263,11 +263,15 @@ class ToolAwareWorkflowExecutor:
         try:
             response = self.designer_service.generate(prompt=prompt, temperature=0.1)
             raw = response.get("response", "") if isinstance(response, dict) else str(response)
-            # Extract JSON block
-            match = re.search(r"\{.*\}", raw, re.DOTALL)
+
+            # Strip markdown fences (```json ... ``` or ``` ... ```)
+            clean = re.sub(r"```(?:json)?\s*", "", raw).replace("```", "").strip()
+
+            # Extract the first complete JSON object
+            match = re.search(r"\{.*\}", clean, re.DOTALL)
             if match:
                 return json.loads(match.group())
-            return json.loads(raw)
+            return json.loads(clean)
         except Exception as exc:
             logger.error(f"Designer JSON parse error: {exc}\nRaw: {raw[:300]}")
             return None
@@ -394,17 +398,30 @@ class ToolAwareWorkflowExecutor:
         return "\n".join(lines)
 
     def _extract_final_answer(self) -> str:
-        """Find the ORGANIZE_SOLUTION output or last meaningful action."""
-        # Prefer organized solution
-        for key, action in self.state.actions.items():
-            if "organiz" in key.lower() or "final" in key.lower():
-                return action.get("content", "")
-        # Fallback: last action with content
-        for action in reversed(list(self.state.actions.values())):
+        """Find the best final answer from state actions."""
+        actions = self.state.actions
+
+        # 1. Prefer explicitly organised / final answer
+        for key in actions:
+            if any(tok in key.lower() for tok in ("organiz", "final", "answer", "extract")):
+                content = actions[key].get("content", "")
+                if content and len(content) > 5:
+                    return content
+
+        # 2. Prefer extracted tool results
+        for key in actions:
+            if any(tok in key.lower() for tok in ("extracted", "result", "sql_result", "search_result")):
+                content = actions[key].get("content", "")
+                if content and len(content) > 5:
+                    return content
+
+        # 3. Fallback: last action with meaningful content
+        for action in reversed(list(actions.values())):
             content = action.get("content", "")
-            if content and len(content) > 20:
+            if content and len(content) > 10:
                 return content
-        return "(no answer found)"
+
+        return ""
 
     def _make_llm_client(self):
         """Create a thin wrapper around executor_service for ToolAwareLLMOperator."""

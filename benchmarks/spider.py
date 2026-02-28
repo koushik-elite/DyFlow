@@ -219,6 +219,21 @@ class SpiderBenchmark(BaseBenchmark):
             return problem
 
         pred_output = pred_output or ""
+
+        # If workflow returned nothing useful, score as wrong but don't crash
+        if not pred_output.strip():
+            problem.update({
+                "predicted_sql":   "",
+                "raw_output":      "",
+                "gold_sql":        gold_sql,
+                "judge_result":    False,
+                "correct":         False,
+                "execution_error": "Workflow returned empty answer",
+                "design_history":  design_history,
+                "hardness":        hardness,
+            })
+            return problem
+
         correct, pred_clean, exec_err = self._score_prediction(db_id, pred_output, gold_sql)
 
         problem["predicted_sql"]    = pred_clean
