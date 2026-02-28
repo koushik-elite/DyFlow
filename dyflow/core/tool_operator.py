@@ -128,9 +128,8 @@ Row Count: <number of rows returned>
 Error Details: <if applicable>""",
 
     # ── TOOL_REVIEW ───────────────────────────────────────────────────────────
-    "TOOL_REVIEW": """You are a rigorous auditor of externally retrieved information. Your role is to
-critically assess whether the tool output is accurate, relevant, and sufficient
-to support the current subgoal before it is used in downstream reasoning.
+    "TOOL_REVIEW": """You are an auditor of externally retrieved information. Your role is to
+assess whether the tool output is relevant and usable for the current subgoal.
 
 Context:
 {context}
@@ -144,19 +143,19 @@ Tool Output:
 {tool_output}
 
 Instructions:
-- Verify that the tool output directly addresses the information need of the subgoal.
-- Check for factual inconsistencies, outdated information, or domain mismatches.
-- Assess whether the retrieved data is complete or only partially answers the need.
-- Identify any hallucinated, interpolated, or unverifiable content in the output.
-- Flag low-confidence or contradictory results that require a retry or reformulation.
-- Do NOT attempt to re-execute the tool; only audit what was returned.
+- Assess whether the tool output is relevant to the subgoal (even partially).
+- Check if the output contains real data (not mock/placeholder/error content).
+- Accept partial results — RESULT_EXTRACT will refine them further.
+- Only use 'retry_with_refinement' if the query itself was wrong (wrong topic, wrong database).
+- Only use 'reject' if the output is completely empty, all mock data, or a tool error.
+- If the output contains ANY real, on-topic information — use 'accept'.
 
 Output Format:
 Relevance Check: <does the output address the subgoal? yes / partial / no>
-Accuracy Assessment: <are the facts verifiable and internally consistent?>
-Completeness: <is the retrieved information sufficient for the subgoal?>
+Accuracy Assessment: <are the facts real and on-topic?>
+Completeness: <sufficient / partial / insufficient>
 Identified Issues:
-  - <issue 1, if any>
+  - <issue 1, if any, or "none">
 Overall Verdict: <accept / retry_with_refinement / reject>
 Recommended Action: <proceed / invoke TOOL_REFINE / escalate to designer>""",
 
