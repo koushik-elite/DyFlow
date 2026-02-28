@@ -41,12 +41,12 @@ from benchmarks.gaia import GAIABenchmark
 def build_tool_registry() -> ToolRegistry:
     registry = ToolRegistry()
 
-    serper_key = os.getenv("SERPER_API_KEY", "")
-    if serper_key:
+    serpapi_key = os.getenv("SERPAPI_API_KEY", "")
+    if serpapi_key:
         print("[Tools] WebSearchTool → live (Serper)")
-        registry.register("WEB_SEARCH", WebSearchTool(api_key=serper_key))
+        registry.register("WEB_SEARCH", WebSearchTool(api_key=serpapi_key))
     else:
-        print("[Tools] WebSearchTool → mock (set SERPER_API_KEY for live search)")
+        print("[Tools] WebSearchTool → mock (set SERPAPI_API_KEY for live search)")
         registry.register("WEB_SEARCH", MockWebSearchTool())
 
     # GAIA does not primarily test SQL — register mock to keep registry complete

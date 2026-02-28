@@ -6,5 +6,6 @@ vllm
 numpy
 pandas
 requests
+google-search-results  # SerpAPI client (WebSearchTool)
 tqdm
 google-cloud-aiplatform

@@ -1,20 +1,21 @@
 """
 dyflow/tools/web_search.py
 ──────────────────────────
-WebSearchTool — external web retrieval via the Serper API.
+WebSearchTool — external web retrieval via SerpAPI (Google Search engine).
 
-Falls back gracefully to a MockWebSearchTool (returns canned results)
-when no API key is configured, so experiments can run without a live key.
+Uses the official `serpapi` Python package.
+
+Install:
+    pip install google-search-results
 
 Params accepted by execute()
 -----------------------------
   query  : str  — the search string
-  top_k  : int  — max results to return (default 5)
+  top_k  : int  — max organic results to return (default 5)
 """
 
 from __future__ import annotations
 
-import json
 import os
 from typing import Any, Dict, List, Optional
 
@@ -24,7 +25,7 @@ from .base import BaseTool, ToolResult, ToolStatus
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _format_results(items: List[Dict]) -> str:
-    """Convert a list of {title, link, snippet} dicts to a readable block."""
+    """Convert a list of organic result dicts to a readable block."""
     lines = []
     for i, item in enumerate(items, 1):
         title   = item.get("title",   "(no title)")
@@ -34,25 +35,46 @@ def _format_results(items: List[Dict]) -> str:
     return "\n\n".join(lines)
 
 
-# ── Live tool (Serper) ────────────────────────────────────────────────────────
+def _extract_organic(data: Dict, top_k: int) -> List[Dict]:
+    """
+    Extract organic results from a SerpAPI response dict.
+    SerpAPI returns the list under the key 'organic_results'.
+    """
+    raw = data.get("organic_results", [])
+    results = []
+    for item in raw[:top_k]:
+        results.append({
+            "position": item.get("position"),
+            "title":    item.get("title", ""),
+            "link":     item.get("link", ""),
+            "snippet":  item.get("snippet", ""),
+            "date":     item.get("date", ""),
+        })
+    return results
+
+
+# ── Live tool (SerpAPI) ───────────────────────────────────────────────────────
 
 class WebSearchTool(BaseTool):
     """
-    Issues a query to the Serper.dev Google Search API and returns
-    the top-k organic results.
+    Issues a Google search via SerpAPI and returns the top-k organic results.
 
     Parameters
     ----------
     api_key : str, optional
-        Serper API key. Falls back to the SERPER_API_KEY env var.
+        SerpAPI key. Falls back to the SERPAPI_API_KEY env var.
     top_k   : int
-        Default number of results to retrieve (overrideable per call).
+        Default number of organic results to retrieve per call.
+
+    Requirements
+    ------------
+        pip install google-search-results
     """
 
     tool_name = "WEB_SEARCH"
 
     def __init__(self, api_key: Optional[str] = None, top_k: int = 5) -> None:
-        self.api_key   = api_key or os.getenv("SERPER_API_KEY", "")
+        self.api_key   = api_key or os.getenv("SERPAPI_API_KEY", "")
         self.default_k = top_k
 
     def execute(self, params: Dict[str, Any]) -> ToolResult:
@@ -69,74 +91,93 @@ class WebSearchTool(BaseTool):
             )
 
         if not self.api_key:
-            # ── Fallback: no API key configured ──────────────────────────────
             return ToolResult(
                 status=ToolStatus.ERROR,
                 raw_output="",
                 tool_name=self.tool_name,
                 query=query,
                 error_message=(
-                    "SERPER_API_KEY is not set. "
+                    "SERPAPI_API_KEY is not set. "
                     "Use MockWebSearchTool for offline testing."
                 ),
             )
 
         try:
-            import requests  # soft import — only needed at call time
+            from serpapi import GoogleSearch
         except ImportError:
             return ToolResult(
                 status=ToolStatus.ERROR,
                 raw_output="",
                 tool_name=self.tool_name,
                 query=query,
-                error_message="'requests' library not installed. Run: pip install requests",
+                error_message=(
+                    "'serpapi' package not installed. "
+                    "Run: pip install google-search-results"
+                ),
             )
-
-        payload = json.dumps({"q": query, "num": top_k})
-        headers = {
-            "X-API-KEY":     self.api_key,
-            "Content-Type":  "application/json",
-        }
 
         try:
-            response = requests.post(
-                "https://google.serper.dev/search",
-                headers=headers,
-                data=payload,
-                timeout=15,
-            )
-            response.raise_for_status()
-            data = response.json()
+            search = GoogleSearch({
+                "engine":  "google",
+                "q":       query,
+                "num":     top_k,
+                "api_key": self.api_key,
+            })
+            data = search.get_dict()
         except Exception as exc:
             return ToolResult(
                 status=ToolStatus.ERROR,
                 raw_output="",
                 tool_name=self.tool_name,
                 query=query,
-                error_message=f"Serper API error: {exc}",
+                error_message=f"SerpAPI error: {exc}",
             )
 
-        organic = data.get("organic", [])[:top_k]
+        # Check for API-level errors
+        if "error" in data:
+            return ToolResult(
+                status=ToolStatus.ERROR,
+                raw_output="",
+                tool_name=self.tool_name,
+                query=query,
+                error_message=f"SerpAPI returned error: {data['error']}",
+            )
+
+        organic = _extract_organic(data, top_k)
+
         if not organic:
             return ToolResult(
                 status=ToolStatus.EMPTY,
-                raw_output="No results found.",
+                raw_output="No organic results found.",
                 tool_name=self.tool_name,
                 query=query,
             )
 
         raw = _format_results(organic)
+
+        # Include useful extras from the response
+        metadata = {}
+        if "answer_box" in data:
+            ab = data["answer_box"]
+            metadata["answer_box"] = ab.get("answer") or ab.get("snippet", "")
+        if "knowledge_graph" in data:
+            kg = data["knowledge_graph"]
+            metadata["knowledge_graph"] = kg.get("description", "")
+
         return ToolResult(
             status=ToolStatus.SUCCESS,
             raw_output=raw,
             tool_name=self.tool_name,
             query=query,
-            structured={"results": organic},
-            metadata={"answer_box": data.get("answerBox"), "knowledge_graph": data.get("knowledgeGraph")},
+            structured={
+                "results": organic,
+                "total_results": data.get("search_information", {}).get("total_results"),
+            },
+            metadata=metadata,
         )
 
 
-# ── Offline stub (for unit tests / no-key environments) ──────────────────────
+# ── Offline stub ──────────────────────────────────────────────────────────────
 
 class MockWebSearchTool(BaseTool):
     """
@@ -150,15 +191,19 @@ class MockWebSearchTool(BaseTool):
         query = params.get("query", "(empty)")
         mock_results = [
             {
-                "title":   f"Mock Result 1 for: {query}",
-                "link":    "https://example.com/1",
-                "snippet": f"This is a mock search result for the query '{query}'. "
-                           "It contains placeholder information for offline testing.",
+                "position": 1,
+                "title":    f"Mock Result 1 for: {query}",
+                "link":     "https://example.com/1",
+                "snippet":  f"This is a mock search result for '{query}'. "
+                            "It contains placeholder information for offline testing.",
+                "date":     "",
             },
             {
-                "title":   f"Mock Result 2 for: {query}",
-                "link":    "https://example.com/2",
-                "snippet": f"Another mock result providing additional context about '{query}'.",
+                "position": 2,
+                "title":    f"Mock Result 2 for: {query}",
+                "link":     "https://example.com/2",
+                "snippet":  f"Another mock result with additional context about '{query}'.",
+                "date":     "",
             },
         ]
         return ToolResult(
