@@ -221,6 +221,48 @@ class WorkflowExecutor:
         
         raise ValueError("Could not extract valid JSON from response")
 
+    def _repair_truncated_json(self, text: str) -> Optional[Dict[str, Any]]:
+        """
+        Attempt to fix a truncated JSON string by closing all open brackets.
+        Mirrors the same repair logic in ToolAwareWorkflowExecutor.
+        """
+        # Find the start of the JSON object
+        start = text.find("{")
+        if start == -1:
+            return None
+        text = text[start:]
+
+        # Strip trailing incomplete key-value pair (e.g. `  "key": `)
+        text = re.sub(r',?\s*"[^"]*"\s*:\s*$', '', text.rstrip()).rstrip().rstrip(',')
+
+        # Count and close unclosed brackets using a state machine
+        stack = []
+        in_string = False
+        escape = False
+        for ch in text:
+            if escape:
+                escape = False
+                continue
+            if ch == '\\' and in_string:
+                escape = True
+                continue
+            if ch == '"':
+                in_string = not in_string
+                continue
+            if in_string:
+                continue
+            if ch in ('{', '['):
+                stack.append('}' if ch == '{' else ']')
+            elif ch in ('}', ']'):
+                if stack and stack[-1] == ch:
+                    stack.pop()
+
+        repaired = text + ''.join(reversed(stack))
+        try:
+            return json.loads(repaired)
+        except Exception:
+            return None
+
     def _find_balanced_json(self, text: str) -> Optional[Dict[str, Any]]:
         """
         Find balanced JSON objects using bracket matching.
@@ -306,15 +348,23 @@ class WorkflowExecutor:
             state_summary=state_summary
         ) + stage_count_notice
 
-        # Call the designer LLM
-        response = self.designer_llm.generate(prompt=prompt, temperature=0.1)
+        # Call the designer LLM — use 8192 tokens so complex stage JSON is never truncated
+        response = self.designer_llm.generate(prompt=prompt, temperature=0.1, max_tokens=8192)
         design_output = response['response']
         try:
+            # Strip markdown fences before parsing (Gemini wraps output in ```json ... ```)
+            clean_output = re.sub(r"```(?:json)?\s*", "", design_output).replace("```", "").strip()
+
             # Extract and parse JSON from the LLM response
             try:
-                stage_design = self._extract_json_from_string(design_output)
-            except Exception as e:
-                raise ValueError(f"Failed to parse designer LLM response JSON: {str(e)}")
+                stage_design = self._extract_json_from_string(clean_output)
+            except Exception:
+                # Attempt JSON repair for truncated responses
+                repaired = self._repair_truncated_json(clean_output)
+                if repaired:
+                    stage_design = repaired
+                else:
+                    raise ValueError(f"Failed to parse designer LLM response JSON: Could not extract valid JSON from response")
             
             # Validate the stage design with more detailed feedback
             required_keys = ["stage_id", "stage_description", "operators"]
