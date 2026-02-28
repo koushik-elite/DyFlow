@@ -1,6 +1,13 @@
 import sys
 import os
 
+# Load environment variables from .env file
+try:
+    from dotenv import load_dotenv
+    load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"))
+except ImportError:
+    pass  # python-dotenv not installed; rely on shell environment
+
 # Add parent directory to Python path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
