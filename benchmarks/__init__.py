@@ -6,6 +6,7 @@ from .livebench import LiveBenchBenchmark
 from .math import MATHBenchmark as MathBenchmark
 from .pubmedqa import PubMedQABenchmark
 from .socialmaze import SocialMazeBenchmark
+from .gaia import GAIABenchmark
 
 __all__ = [
     "BaseBenchmark",
@@ -14,4 +15,5 @@ __all__ = [
     "MathBenchmark",
     "PubMedQABenchmark",
     "SocialMazeBenchmark",
+    "GAIABenchmark",
 ]
