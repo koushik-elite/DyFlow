@@ -66,30 +66,30 @@ Current Execution Summary:
 ## Tool Operators (External tool execution)
 11. SEARCH_QUERY_FORMULATE — Construct the optimal web search query before retrieval.
     Use when: the subgoal requires external factual knowledge and the query needs refinement.
-    Output: formulated_query_{id}
+    Output: formulated_query_{{id}}
 
 12. WEB_SEARCH         — Retrieve and summarise information from the web.
     Use when: the task requires up-to-date factual knowledge beyond the model's parametric memory.
     Always pair with: SEARCH_QUERY_FORMULATE → WEB_SEARCH → TOOL_REVIEW
-    Output: search_result_{id}
+    Output: search_result_{{id}}
 
 13. SQL_QUERY          — Generate and execute a SQL query against a database.
     Use when: the task involves structured data retrieval, aggregation, or filtering.
     Always pair with: SQL_QUERY → TOOL_REVIEW → RESULT_EXTRACT
-    Output: sql_result_{id}
+    Output: sql_result_{{id}}
 
 14. TOOL_REVIEW        — Audit tool output quality and relevance.
     Use when: immediately after WEB_SEARCH or SQL_QUERY.
     Output verdict: accept / retry_with_refinement / reject
-    Output: tool_review_{id}
+    Output: tool_review_{{id}}
 
 15. TOOL_REFINE        — Diagnose and correct a failed tool call.
     Use when: TOOL_REVIEW verdict is 'retry_with_refinement'.
-    Output: tool_refined_result_{id}
+    Output: tool_refined_result_{{id}}
 
 16. RESULT_EXTRACT     — Distil raw tool output into clean memory buffer entries.
     Use when: after TOOL_REVIEW verdict is 'accept', before GENERATE_ANSWER.
-    Output: extracted_result_{id}
+    Output: extracted_result_{{id}}
 
 # Design Rules
 
@@ -243,9 +243,10 @@ class ToolAwareWorkflowExecutor:
 
     def _design_stage(self) -> Optional[Dict]:
         summary = self._summarise_state()
-        prompt  = TOOL_DESIGN_STAGE_PROMPT.format(
-            problem_description=self.problem_description,
-            state_summary=summary,
+        prompt = (
+            TOOL_DESIGN_STAGE_PROMPT
+            .replace("{problem_description}", self.problem_description)
+            .replace("{state_summary}", summary)
         )
         try:
             raw = self.designer_service.chat(prompt)
