@@ -248,8 +248,10 @@ class ToolAwareWorkflowExecutor:
             .replace("{problem_description}", self.problem_description)
             .replace("{state_summary}", summary)
         )
+        raw = ""
         try:
-            raw = self.designer_service.chat(prompt)
+            response = self.designer_service.generate(prompt=prompt, temperature=0.1)
+            raw = response.get("response", "") if isinstance(response, dict) else str(response)
             # Extract JSON block
             match = re.search(r"\{.*\}", raw, re.DOTALL)
             if match:
@@ -399,6 +401,9 @@ class ToolAwareWorkflowExecutor:
 
         class _LLMClientWrapper:
             def chat(self, prompt: str) -> str:
-                return service.generate(prompt)
+                result = service.generate(prompt=prompt)
+                if isinstance(result, dict):
+                    return result.get("response", "") or ""
+                return str(result)
 
         return _LLMClientWrapper()
