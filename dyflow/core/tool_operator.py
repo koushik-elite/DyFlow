@@ -216,6 +216,7 @@ Instructions:
 - Structure extracted information as typed key-value entries.
 - Preserve source attribution for each extracted fact (URL or table name).
 - If no relevant information can be extracted, state this explicitly.
+- The Final Answer field MUST be a concise direct answer to the original problem (1-2 sentences max).
 
 Output Format:
 Extracted Facts:
@@ -223,7 +224,8 @@ Extracted Facts:
   <key_2>: <value_2>  [source: <ref>]
 Summary: <2–3 sentence synthesis of the extracted content>
 Extraction Confidence: <high / medium / low>
-Unresolved Conflicts: <any contradictory facts noted>""",
+Unresolved Conflicts: <any contradictory facts noted>
+Final Answer: <concise direct answer to the original problem — this is the most important field>""",
 }
 
 

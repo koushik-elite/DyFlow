@@ -453,26 +453,47 @@ class ToolAwareWorkflowExecutor:
         return "\n".join(lines)
 
     def _extract_final_answer(self) -> str:
-        """Find the best final answer from state actions."""
+        """
+        Extract the best final answer from state actions.
+
+        Priority:
+          1. Any action with 'final_answer' or 'ORGANIZE_SOLUTION' output key
+          2. 'Final Answer:' line inside any RESULT_EXTRACT / extracted action
+          3. 'Summary:' line from a RESULT_EXTRACT action
+          4. Last action with meaningful content
+        """
         actions = self.state.actions
 
-        # 1. Prefer explicitly organised / final answer
+        # 1. Explicit final_answer / organise output
         for key in actions:
-            if any(tok in key.lower() for tok in ("organiz", "final", "answer", "extract")):
-                content = actions[key].get("content", "")
+            if any(tok in key.lower() for tok in ("final_answer", "organiz")):
+                content = actions[key].get("content", "").strip()
                 if content and len(content) > 5:
                     return content
 
-        # 2. Prefer extracted tool results
+        # 2. Parse 'Final Answer:' line from any RESULT_EXTRACT output
         for key in actions:
-            if any(tok in key.lower() for tok in ("extracted", "result", "sql_result", "search_result")):
+            if any(tok in key.lower() for tok in ("extract", "result")):
                 content = actions[key].get("content", "")
-                if content and len(content) > 5:
-                    return content
+                match = re.search(r"Final Answer\s*:\s*(.+?)(?:\n|$)", content, re.IGNORECASE)
+                if match:
+                    answer = match.group(1).strip()
+                    if answer and answer.lower() not in ("none", "n/a", "(not available)"):
+                        return answer
 
-        # 3. Fallback: last action with meaningful content
+        # 3. Parse 'Summary:' as a fallback
+        for key in actions:
+            if any(tok in key.lower() for tok in ("extract", "result")):
+                content = actions[key].get("content", "")
+                match = re.search(r"Summary\s*:\s*(.+?)(?:\n|$)", content, re.IGNORECASE)
+                if match:
+                    summary = match.group(1).strip()
+                    if summary and len(summary) > 10:
+                        return summary
+
+        # 4. Last action with meaningful content
         for action in reversed(list(actions.values())):
-            content = action.get("content", "")
+            content = action.get("content", "").strip()
             if content and len(content) > 10:
                 return content
 

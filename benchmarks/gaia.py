@@ -144,23 +144,28 @@ class GAIABenchmark(BaseBenchmark):
     ) -> Tuple[str, bool, bool]:
         """
         Returns (extracted_answer, exact_match_bool, contains_match_bool).
-        Falls back to heuristic extraction if no judge service.
         """
-        # Always try heuristic first (fast path)
-        em = exact_match(model_output, ground_truth)
-        cm = contains_match(model_output, ground_truth)
+        # 1. Try to parse explicit 'Final Answer:' line from the workflow output
+        fa_match = re.search(r"Final Answer\s*:\s*(.+?)(?:\n|$)", model_output, re.IGNORECASE)
+        clean_output = fa_match.group(1).strip() if fa_match else model_output
 
-        if em or not self.use_llm_judge or judge_service is None:
-            return model_output, em, cm
+        # 2. Fast-path exact/contains match on cleaned output
+        em = exact_match(clean_output, ground_truth)
+        cm = contains_match(clean_output, ground_truth)
+        if em:
+            return clean_output, True, True
 
-        # Use LLM judge to extract cleaner final answer
-        extracted, judge_correct = self._extract_answer_with_llm(
-            question, model_output, ground_truth, judge_service
-        )
-        em_extracted = exact_match(extracted, ground_truth)
-        cm_extracted = contains_match(extracted, ground_truth)
+        # 3. LLM judge for ambiguous cases
+        if self.use_llm_judge and judge_service is not None:
+            extracted, judge_correct = self._extract_answer_with_llm(
+                question, model_output, ground_truth, judge_service
+            )
+            if extracted:
+                em = em or exact_match(extracted, ground_truth) or judge_correct
+                cm = cm or contains_match(extracted, ground_truth)
+                return extracted, em, cm
 
-        return extracted, (em or em_extracted or judge_correct), (cm or cm_extracted)
+        return clean_output, em, cm
 
     # ── Core evaluation ────────────────────────────────────────────────────────
 
