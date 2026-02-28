@@ -110,33 +110,39 @@ Current Execution Summary:
 
 12. WEB_SEARCH         — Retrieve and summarise information from the web.
     Use when: the task requires up-to-date factual knowledge beyond the model's parametric memory.
-    Always pair with: SEARCH_QUERY_FORMULATE → WEB_SEARCH → TOOL_REVIEW
+    Always pair with: SEARCH_QUERY_FORMULATE → WEB_SEARCH → TOOL_REVIEW → RESULT_EXTRACT
     Output: search_result_{{id}}
 
-13. SQL_QUERY          — Generate and execute a SQL query against a database.
+13. SQL_GENERATE       — Write a precise SQLite SELECT query for the given schema and question.
+    Use when: BEFORE every SQL_QUERY — this generates the SQL the tool will execute.
+    Output key must contain "sql_generate" (e.g. "sql_generate_{{id}}")
+    Input keys: ["schema", "question"] or ["original_problem"]
+
+14. SQL_QUERY          — Execute a SQL query against the database.
     Use when: the task involves structured data retrieval, aggregation, or filtering.
-    Always pair with: SQL_QUERY → TOOL_REVIEW → RESULT_EXTRACT
+    ALWAYS pair with: SQL_GENERATE → SQL_QUERY → TOOL_REVIEW → RESULT_EXTRACT
+    The SQL_QUERY operator reads the SQL from the SQL_GENERATE output automatically.
     Output: sql_result_{{id}}
 
-14. TOOL_REVIEW        — Audit tool output quality and relevance.
+15. TOOL_REVIEW        — Audit tool output quality and relevance.
     Use when: immediately after WEB_SEARCH or SQL_QUERY.
     Output verdict: accept / retry_with_refinement / reject
     Output: tool_review_{{id}}
 
-15. TOOL_REFINE        — Diagnose and correct a failed tool call.
+16. TOOL_REFINE        — Diagnose and correct a failed tool call.
     Use when: TOOL_REVIEW verdict is 'retry_with_refinement'.
     Output: tool_refined_result_{{id}}
 
-16. RESULT_EXTRACT     — Distil raw tool output into clean memory buffer entries.
-    Use when: after TOOL_REVIEW verdict is 'accept', before GENERATE_ANSWER.
+17. RESULT_EXTRACT     — Distil raw tool output into clean memory buffer entries.
+    Use when: after TOOL_REVIEW verdict is 'accept', before ORGANIZE_SOLUTION.
     Output: extracted_result_{{id}}
 
 # Design Rules
 
 1. Stage Structure:
    - Typical stage: 3–4 operators working together to achieve an intermediate goal
-   - Tool stage pattern: [SEARCH_QUERY_FORMULATE →] WEB_SEARCH → TOOL_REVIEW → RESULT_EXTRACT
-   - SQL stage pattern: SQL_QUERY → TOOL_REVIEW → RESULT_EXTRACT
+   - Web search pattern: SEARCH_QUERY_FORMULATE → WEB_SEARCH → TOOL_REVIEW → RESULT_EXTRACT
+   - SQL pattern: SQL_GENERATE → SQL_QUERY → TOOL_REVIEW → RESULT_EXTRACT
    - Termination stage: ONLY ORGANIZE_SOLUTION — never mix with other operators
    - Maximum 7 stages total
 
@@ -147,12 +153,13 @@ Current Execution Summary:
 
 3. Input Keys:
    - Always reference existing output_key names from the summary
-   - For tool operators: reference the formulated_query or sql_query from prior operators
+   - For SQL_GENERATE: use input_keys ["schema", "question"] — these are pre-seeded from the problem
+   - For SQL_QUERY: no explicit input_keys needed — it reads SQL_GENERATE output automatically
    - For any reasoning operator needing the problem: include "original_problem" in input_keys
 
 4. Tool Selection Guidelines:
    - If a question requires recent/external facts → use WEB_SEARCH chain
-   - If a question involves structured data/tables → use SQL_QUERY chain
+   - If a question involves structured data/tables → use SQL_GENERATE → SQL_QUERY chain
    - If a question is self-contained and logical → use pure reasoning operators
    - Never use WEB_SEARCH and SQL_QUERY in the same stage
 

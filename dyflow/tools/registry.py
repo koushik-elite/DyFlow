@@ -43,6 +43,7 @@ class ToolRegistry:
         "TOOL_REFINE",
         "RESULT_EXTRACT",
         "SEARCH_QUERY_FORMULATE",
+        "SQL_GENERATE",          # LLM writes the SQL; SQL_QUERY tool executes it
     }
 
     def __init__(self) -> None:

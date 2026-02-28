@@ -62,6 +62,35 @@ Alternative Queries:
   2. <variant 2>
 Rationale: <one sentence explaining why this query best targets the subgoal>""",
 
+    # ── SQL_GENERATE ──────────────────────────────────────────────────────────
+    "SQL_GENERATE": """You are an expert SQLite SQL engineer. Generate a precise SQL SELECT query
+to answer the natural language question using the provided schema.
+
+Context:
+{context}
+
+Guidance:
+{guidance}
+
+Database Schema:
+{schema}
+
+Question:
+{question}
+
+Rules:
+- Write valid SQLite syntax only.
+- Use only tables and columns that exist in the schema above.
+- Prefer explicit column names over SELECT *.
+- Use JOINs when data spans multiple tables.
+- Use GROUP BY with aggregates (COUNT, SUM, AVG, MAX, MIN).
+- Use subqueries or CTEs for complex logic.
+- Do NOT include any explanation — output the SQL query only.
+- Do NOT wrap in markdown fences.
+
+Output Format:
+SQL: <single valid SQLite SELECT statement ending with semicolon>""",
+
     # ── WEB_SEARCH ────────────────────────────────────────────────────────────
     # Note: this template is used to FORMAT the result for memory storage
     # (actual retrieval is done by WebSearchTool.execute, not the LLM)
@@ -414,9 +443,13 @@ class ToolExecutorOperator(Operator):
             query = (
                 resolved_inputs.get("sql_query")
                 or resolved_inputs.get("query")
+                or self._find_generated_sql(state)
                 or self._find_refined_query(state)
                 or guidance.strip()
             )
+            # Strip any residual markdown fences or "SQL:" prefix
+            query = re.sub(r"```(?:sql)?\s*", "", query).replace("```", "").strip()
+            query = re.sub(r"^SQL\s*:\s*", "", query, flags=re.IGNORECASE).strip()
             return {
                 "query": query,
                 "limit": params.get("limit", 50),
@@ -432,6 +465,23 @@ class ToolExecutorOperator(Operator):
                 match   = re.search(r"Primary Query\s*:\s*(.+?)(?:\n|$)", content, re.IGNORECASE)
                 if match:
                     return match.group(1).strip().strip("`")
+        return None
+
+    def _find_generated_sql(self, state: State) -> Optional[str]:
+        """Scan state memory for SQL_GENERATE output and extract the SQL statement."""
+        for key, val in state.actions.items():
+            if any(tok in key.lower() for tok in ("sql_generate", "generated_sql", "sql_query_gen")):
+                content = val.get("content", "")
+                # Parse "SQL: <statement>" format
+                match = re.search(r"SQL\s*:\s*(SELECT.+?)(?:;?\s*$)", content,
+                                  re.IGNORECASE | re.DOTALL)
+                if match:
+                    return match.group(1).strip().rstrip(";") + ";"
+                # Fallback: grab any SELECT statement
+                match = re.search(r"(SELECT\s+.+?)(?:;|$)", content,
+                                  re.IGNORECASE | re.DOTALL)
+                if match:
+                    return match.group(1).strip()
         return None
 
     def _find_refined_query(self, state: State) -> Optional[str]:

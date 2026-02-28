@@ -409,7 +409,17 @@ if __name__ == "__main__":
         "--report-only", action="store_true",
         help="Print metrics from the last saved report without running evaluation",
     )
+    parser.add_argument(
+        "--force", action="store_true",
+        help="Delete any cached temp files and re-run both systems from scratch",
+    )
     args = parser.parse_args()
+
+    if args.force:
+        import glob
+        for f in glob.glob(os.path.join(REPORT_DIR, "temp_*.json")):
+            os.remove(f)
+            print(f"[force] Removed cache: {f}")
 
     if args.report_only:
         show_latest_report(args)
