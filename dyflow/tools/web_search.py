@@ -140,6 +140,9 @@ class WebSearchTool(BaseTool):
                 error_message=f"SerpAPI error: {exc}",
             )
 
+        # Debug: show top-level keys so mismatches are visible in logs
+        print(f"  [SerpAPI] Response keys: {list(data.keys())}")
+
         # Check for API-level errors
         if "error" in data:
             return ToolResult(
@@ -151,6 +154,25 @@ class WebSearchTool(BaseTool):
             )
 
         organic = _extract_organic(data, top_k)
+        print(f"  [SerpAPI] organic_results count: {len(organic)}")
+
+        if not organic:
+            # Print full keys to help diagnose missing organic_results
+            print(f"  [SerpAPI] WARNING: no organic_results. Available keys: {list(data.keys())}")
+            # Try alternate key names some SerpAPI versions use
+            fallback = data.get("results", data.get("web_results", []))
+            if fallback:
+                print(f"  [SerpAPI] Using fallback key with {len(fallback)} results")
+                organic = [
+                    {
+                        "position": i + 1,
+                        "title":    r.get("title", ""),
+                        "link":     r.get("link", r.get("url", "")),
+                        "snippet":  r.get("snippet", r.get("description", "")),
+                        "date":     r.get("date", ""),
+                    }
+                    for i, r in enumerate(fallback[:top_k])
+                ]
 
         if not organic:
             return ToolResult(
