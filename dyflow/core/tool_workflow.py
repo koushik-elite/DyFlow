@@ -35,7 +35,47 @@ from ..tools.registry import ToolRegistry
 logger = logging.getLogger(__name__)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# ── JSON repair helper ────────────────────────────────────────────────────────
+
+def _repair_json(text: str) -> Optional[Dict]:
+    """
+    Attempt to fix a truncated JSON string by closing all open brackets.
+    Returns parsed dict on success, None on failure.
+    """
+    # Remove any trailing incomplete key-value pair (e.g. `  "key": `)
+    text = re.sub(r',?\s*"[^"]*"\s*:\s*$', '', text.rstrip())
+    text = text.rstrip().rstrip(',')
+
+    # Count and close unclosed brackets/braces
+    stack = []
+    in_string = False
+    escape = False
+    for ch in text:
+        if escape:
+            escape = False
+            continue
+        if ch == '\\' and in_string:
+            escape = True
+            continue
+        if ch == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if ch in ('{', '['):
+            stack.append('}' if ch == '{' else ']')
+        elif ch in ('}', ']'):
+            if stack and stack[-1] == ch:
+                stack.pop()
+
+    # Close any remaining open brackets in reverse order
+    closing = ''.join(reversed(stack))
+    repaired_text = text + closing
+
+    try:
+        return json.loads(repaired_text)
+    except Exception:
+        return None
 # UPDATED DESIGN STAGE PROMPT  (includes tool operators)
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -261,7 +301,10 @@ class ToolAwareWorkflowExecutor:
         )
         raw = ""
         try:
-            response = self.designer_service.generate(prompt=prompt, temperature=0.1)
+            # Use 8192 tokens — designer JSON can be large
+            response = self.designer_service.generate(
+                prompt=prompt, temperature=0.1, max_tokens=8192
+            )
             raw = response.get("response", "") if isinstance(response, dict) else str(response)
 
             # Strip markdown fences (```json ... ``` or ``` ... ```)
@@ -270,8 +313,20 @@ class ToolAwareWorkflowExecutor:
             # Extract the first complete JSON object
             match = re.search(r"\{.*\}", clean, re.DOTALL)
             if match:
-                return json.loads(match.group())
-            return json.loads(clean)
+                candidate = match.group()
+            else:
+                candidate = clean
+
+            # Try strict parse first
+            try:
+                return json.loads(candidate)
+            except json.JSONDecodeError:
+                # Attempt to repair truncated JSON by closing open brackets
+                repaired = _repair_json(candidate)
+                if repaired:
+                    return repaired
+                raise
+
         except Exception as exc:
             logger.error(f"Designer JSON parse error: {exc}\nRaw: {raw[:300]}")
             return None
