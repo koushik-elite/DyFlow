@@ -1,92 +1,152 @@
 """
 dyflow/tools/web_search.py
 ──────────────────────────
-WebSearchTool — external web retrieval via SerpAPI (Google Search engine).
+WebSearchTool — live web retrieval via SerpAPI Google AI Mode engine.
 
-Uses the official `serpapi` Python package.
+Uses engine=google_ai_mode which returns a Gemini-2.5-powered AI answer
+grounded in real-time Google search results — ideal for news questions,
+current facts, and post-training knowledge retrieval.
+
+API docs:   https://serpapi.com/google-ai-mode-api
+Engine:     google_ai_mode
+Response:   text_blocks[] + references[] (no organic_results)
 
 Install:
     pip install google-search-results
 
 Params accepted by execute()
 -----------------------------
-  query  : str  — the search string
-  top_k  : int  — max organic results to return (default 5)
+  query                   : str  — the search string
+  top_k                   : int  — max reference sources to include (default 5)
+  subsequent_request_token: str  — optional token for multi-turn follow-ups
 """
 
 from __future__ import annotations
 
 import os
+import requests
 from typing import Any, Dict, List, Optional
 
 from .base import BaseTool, ToolResult, ToolStatus
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+# ── Response parsing ───────────────────────────────────────────────────────────
 
-def _format_results(items: List[Dict]) -> str:
-    """Convert a list of organic result dicts to a readable block."""
+def _extract_text_blocks(data: Dict) -> str:
+    """
+    Flatten google_ai_mode text_blocks into a readable string.
+
+    text_blocks is a list of dicts with fields:
+      type    : "paragraph" | "heading" | "list" | "code" | ...
+      snippet : the text content
+      title   : optional heading for list/expandable blocks
+    """
     lines = []
-    for i, item in enumerate(items, 1):
-        title   = item.get("title",   "(no title)")
-        link    = item.get("link",    "")
-        snippet = item.get("snippet", "")
-        lines.append(f"[{i}] {title}\n    URL: {link}\n    {snippet}")
-    return "\n\n".join(lines)
+    for block in data.get("text_blocks", []):
+        btype   = block.get("type", "paragraph")
+        snippet = block.get("snippet", "")
+        title   = block.get("title", "")
+
+        if btype == "heading":
+            lines.append(f"\n### {snippet or title}")
+        elif btype == "list":
+            if title:
+                lines.append(f"\n{title}:")
+            for item in block.get("list", []):
+                s = item.get("snippet", item) if isinstance(item, dict) else str(item)
+                lines.append(f"  - {s}")
+        elif btype in ("paragraph", "expandable"):
+            if title:
+                lines.append(f"\n{title}")
+            if snippet:
+                lines.append(snippet)
+        elif btype == "code":
+            lines.append(f"```\n{snippet}\n```")
+        else:
+            if snippet:
+                lines.append(snippet)
+
+    return "\n".join(lines).strip()
 
 
-def _extract_organic(data: Dict, top_k: int) -> List[Dict]:
+def _extract_references(data: Dict, top_k: int) -> List[Dict]:
     """
-    Extract organic results from a SerpAPI response dict.
-    SerpAPI returns the list under the key 'organic_results'.
+    Extract reference sources from the google_ai_mode response.
+
+    References are listed under the 'references' key as:
+      [{ title, link, snippet, source }, ...]
     """
-    raw = data.get("organic_results", [])
+    refs = data.get("references", [])
     results = []
-    for item in raw[:top_k]:
+    for i, ref in enumerate(refs[:top_k]):
         results.append({
-            "position": item.get("position"),
-            "title":    item.get("title", ""),
-            "link":     item.get("link", ""),
-            "snippet":  item.get("snippet", ""),
-            "date":     item.get("date", ""),
+            "position": i + 1,
+            "title":    ref.get("title",   ""),
+            "link":     ref.get("link",    ref.get("url", "")),
+            "snippet":  ref.get("snippet", ref.get("description", "")),
+            "source":   ref.get("source",  ""),
         })
     return results
 
 
-# ── Live tool (SerpAPI) ───────────────────────────────────────────────────────
+def _format_references(refs: List[Dict]) -> str:
+    lines = []
+    for r in refs:
+        title   = r.get("title",   "(no title)")
+        link    = r.get("link",    "")
+        snippet = r.get("snippet", "")
+        source  = r.get("source",  "")
+        label   = f"{title} ({source})" if source else title
+        lines.append(f"[{r['position']}] {label}\n    URL: {link}\n    {snippet}")
+    return "\n\n".join(lines)
+
+
+# ── Live tool — google_ai_mode ────────────────────────────────────────────────
 
 class WebSearchTool(BaseTool):
     """
-    Issues a Google search via SerpAPI and returns the top-k organic results.
+    Retrieves answers from SerpAPI's Google AI Mode engine.
+
+    Google AI Mode (powered by Gemini 2.5) returns a structured AI answer
+    grounded in real-time Google search — longer, more detailed, and more
+    accurate for current-knowledge questions than standard organic results.
+
+    The tool output combines:
+      1. AI-generated answer text (from text_blocks)
+      2. Reference sources (title, URL, snippet) used to ground the answer
 
     Parameters
     ----------
-    api_key : str, optional
-        SerpAPI key. Falls back to the SERPAPI_API_KEY env var.
-    top_k   : int
-        Default number of organic results to retrieve per call.
+    api_key   : SerpAPI key — falls back to SERPAPI_API_KEY env var
+    top_k     : max reference sources to include in output (default 5)
+    engine    : SerpAPI engine to use (default: google_ai_mode)
 
     Requirements
     ------------
-        pip install google-search-results
+        pip install requests
     """
 
-    tool_name = "WEB_SEARCH"
+    tool_name  = "WEB_SEARCH"
+    SERPAPI_URL = "https://serpapi.com/search"
 
-    def __init__(self, api_key: Optional[str] = None, top_k: int = 5) -> None:
-        # Support both old (SERPER_API_KEY) and new (SERPAPI_API_KEY) env var names
+    def __init__(
+        self,
+        api_key: Optional[str] = None,
+        top_k: int = 5,
+        engine: str = "google_ai_mode",
+    ) -> None:
         self.api_key = (
             api_key
             or os.getenv("SERPAPI_API_KEY", "")
             or os.getenv("SERPER_API_KEY", "")   # backward compat
         )
         self.default_k = top_k
+        self.engine    = engine
 
     def execute(self, params: Dict[str, Any]) -> ToolResult:
-        query = params.get("query", "").strip()
-        # Strip backticks the LLM sometimes wraps around the query
-        query = query.strip("`").strip()
+        query = params.get("query", "").strip().strip("`").strip()
         top_k = int(params.get("top_k", self.default_k))
+        subsequent_token = params.get("subsequent_request_token", "")
 
         if not query:
             return ToolResult(
@@ -109,100 +169,104 @@ class WebSearchTool(BaseTool):
                 ),
             )
 
+        # ── Build request params ───────────────────────────────────────────────
+        req_params: Dict[str, Any] = {
+            "engine":  self.engine,
+            "q":       query,
+            "api_key": self.api_key,
+            "output":  "json",
+        }
+        if subsequent_token:
+            req_params["subsequent_request_token"] = subsequent_token
+
+        # ── Call SerpAPI ───────────────────────────────────────────────────────
         try:
-            from serpapi import GoogleSearch
-        except ImportError:
+            resp = requests.get(self.SERPAPI_URL, params=req_params, timeout=30)
+            resp.raise_for_status()
+            data = resp.json()
+        except requests.exceptions.Timeout:
             return ToolResult(
                 status=ToolStatus.ERROR,
                 raw_output="",
                 tool_name=self.tool_name,
                 query=query,
-                error_message=(
-                    "'serpapi' package not installed. "
-                    "Run: pip install google-search-results"
-                ),
+                error_message="SerpAPI request timed out (30s).",
             )
-
-        try:
-            search = GoogleSearch({
-                "engine":  "google",
-                "q":       query,
-                "num":     top_k,
-                "api_key": self.api_key,
-            })
-            data = search.get_dict()
-        except Exception as exc:
+        except requests.exceptions.RequestException as exc:
             return ToolResult(
                 status=ToolStatus.ERROR,
                 raw_output="",
                 tool_name=self.tool_name,
                 query=query,
-                error_message=f"SerpAPI error: {exc}",
+                error_message=f"SerpAPI HTTP error: {exc}",
+            )
+        except ValueError as exc:
+            return ToolResult(
+                status=ToolStatus.ERROR,
+                raw_output="",
+                tool_name=self.tool_name,
+                query=query,
+                error_message=f"SerpAPI JSON parse error: {exc}",
             )
 
-        # Debug: show top-level keys so mismatches are visible in logs
-        print(f"  [SerpAPI] Response keys: {list(data.keys())}")
+        print(f"  [SerpAPI/{self.engine}] Response keys: {list(data.keys())}")
 
-        # Check for API-level errors
+        # ── API-level error ────────────────────────────────────────────────────
         if "error" in data:
             return ToolResult(
                 status=ToolStatus.ERROR,
                 raw_output="",
                 tool_name=self.tool_name,
                 query=query,
-                error_message=f"SerpAPI returned error: {data['error']}",
+                error_message=f"SerpAPI error: {data['error']}",
             )
 
-        organic = _extract_organic(data, top_k)
-        print(f"  [SerpAPI] organic_results count: {len(organic)}")
+        # ── Extract AI answer text ─────────────────────────────────────────────
+        ai_text    = _extract_text_blocks(data)
+        references = _extract_references(data, top_k)
 
-        if not organic:
-            # Print full keys to help diagnose missing organic_results
-            print(f"  [SerpAPI] WARNING: no organic_results. Available keys: {list(data.keys())}")
-            # Try alternate key names some SerpAPI versions use
-            fallback = data.get("results", data.get("web_results", []))
-            if fallback:
-                print(f"  [SerpAPI] Using fallback key with {len(fallback)} results")
-                organic = [
-                    {
-                        "position": i + 1,
-                        "title":    r.get("title", ""),
-                        "link":     r.get("link", r.get("url", "")),
-                        "snippet":  r.get("snippet", r.get("description", "")),
-                        "date":     r.get("date", ""),
-                    }
-                    for i, r in enumerate(fallback[:top_k])
-                ]
+        print(f"  [SerpAPI/{self.engine}] text_blocks: {len(data.get('text_blocks', []))}  |  references: {len(references)}")
 
-        if not organic:
+        if not ai_text and not references:
+            print(f"  [SerpAPI/{self.engine}] WARNING: empty response. Keys: {list(data.keys())}")
             return ToolResult(
                 status=ToolStatus.EMPTY,
-                raw_output="No organic results found.",
+                raw_output="Google AI Mode returned no content for this query.",
                 tool_name=self.tool_name,
                 query=query,
             )
 
-        raw = _format_results(organic)
+        # ── Compose final output ───────────────────────────────────────────────
+        parts = []
+        if ai_text:
+            parts.append("=== Google AI Mode Answer ===")
+            parts.append(ai_text)
+        if references:
+            parts.append("\n=== Sources ===")
+            parts.append(_format_references(references))
 
-        # Include useful extras from the response
-        metadata = {}
-        if "answer_box" in data:
-            ab = data["answer_box"]
-            metadata["answer_box"] = ab.get("answer") or ab.get("snippet", "")
-        if "knowledge_graph" in data:
-            kg = data["knowledge_graph"]
-            metadata["knowledge_graph"] = kg.get("description", "")
+        raw_output = "\n".join(parts)
+
+        # subsequent_request_token enables multi-turn follow-up queries
+        next_token = data.get("subsequent_request_token", "")
+        if next_token:
+            print(f"  [SerpAPI/{self.engine}] subsequent_request_token available for follow-up")
 
         return ToolResult(
             status=ToolStatus.SUCCESS,
-            raw_output=raw,
+            raw_output=raw_output,
             tool_name=self.tool_name,
             query=query,
             structured={
-                "results": organic,
-                "total_results": data.get("search_information", {}).get("total_results"),
+                "ai_answer":   ai_text,
+                "references":  references,
+                "text_blocks": data.get("text_blocks", []),
             },
-            metadata=metadata,
+            metadata={
+                "engine":                   self.engine,
+                "subsequent_request_token": next_token,
+                "search_metadata":          data.get("search_metadata", {}),
+            },
         )
 
 
@@ -210,7 +274,7 @@ class WebSearchTool(BaseTool):
 
 class MockWebSearchTool(BaseTool):
     """
-    Returns a deterministic fake result.
+    Returns deterministic fake AI Mode results.
     Useful for unit tests and local development without a live API key.
     """
 
@@ -218,28 +282,35 @@ class MockWebSearchTool(BaseTool):
 
     def execute(self, params: Dict[str, Any]) -> ToolResult:
         query = params.get("query", "(empty)")
-        mock_results = [
+        ai_text = (
+            f"=== Google AI Mode Answer ===\n"
+            f"Based on current information, here is a synthesised answer for: '{query}'.\n"
+            f"This is a mock response generated for offline testing. "
+            f"In production, the Google AI Mode engine returns a real "
+            f"Gemini-2.5-powered answer grounded in live Google search results."
+        )
+        refs = [
             {
                 "position": 1,
-                "title":    f"Mock Result 1 for: {query}",
+                "title":    f"Mock Source 1 for: {query}",
                 "link":     "https://example.com/1",
-                "snippet":  f"This is a mock search result for '{query}'. "
-                            "It contains placeholder information for offline testing.",
-                "date":     "",
+                "snippet":  f"Mock snippet describing context for '{query}'.",
+                "source":   "example.com",
             },
             {
                 "position": 2,
-                "title":    f"Mock Result 2 for: {query}",
+                "title":    f"Mock Source 2 for: {query}",
                 "link":     "https://example.com/2",
-                "snippet":  f"Another mock result with additional context about '{query}'.",
-                "date":     "",
+                "snippet":  f"Another mock source with additional context.",
+                "source":   "example.com",
             },
         ]
+        ref_text = "\n\n=== Sources ===\n" + _format_references(refs)
         return ToolResult(
             status=ToolStatus.SUCCESS,
-            raw_output=_format_results(mock_results),
+            raw_output=ai_text + ref_text,
             tool_name=self.tool_name,
             query=query,
-            structured={"results": mock_results},
-            metadata={"mock": True},
+            structured={"ai_answer": ai_text, "references": refs, "text_blocks": []},
+            metadata={"mock": True, "engine": "google_ai_mode"},
         )
