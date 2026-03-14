@@ -506,7 +506,7 @@ class WorkflowExecutor:
         termination_reason = None
         final_answer = None
         iteration_count = 0  # Track the number of iterations
-        max_iterations = 8 
+        max_iterations = 4
         pattern_history: List[tuple] = []
 
         while should_continue and iteration_count < max_iterations:

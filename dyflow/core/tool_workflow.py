@@ -240,7 +240,7 @@ class ToolAwareWorkflowExecutor:
 
     # ── Public entry point ────────────────────────────────────────────────────
 
-    def run(self, max_steps: int = 7) -> Tuple[str, Any]:
+    def run(self, max_steps: int = 4) -> Tuple[str, Any]:
         """
         Execute the tool-augmented DyFlow loop.
 
