@@ -87,7 +87,7 @@ def make_dyflow_t_fn(designer, executor, db_root: str):
             max_tool_retries=2,
         )
         try:
-            answer, traj = wf.run(max_steps=8)
+            answer, traj = wf.run(max_steps=4)
             history = getattr(wf.state, "design_history", [])
             return answer or "", history
         except Exception as e:

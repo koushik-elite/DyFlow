@@ -89,7 +89,7 @@ def main():
     # ── Run ───────────────────────────────────────────────────────────────────
     print("Starting DyFlow-T execution...")
     print("-" * 60)
-    final_answer, trajectory = executor.run(max_steps=8)
+    final_answer, trajectory = executor.run(max_steps=4)
 
     # ── Results ───────────────────────────────────────────────────────────────
     print("\n" + "=" * 60)

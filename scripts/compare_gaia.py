@@ -109,7 +109,7 @@ def make_dyflow_t_fn(designer: ModelService, executor: ModelService):
             max_tool_retries=2,
         )
         try:
-            answer, trajectory = wf.run(max_steps=8)
+            answer, trajectory = wf.run(max_steps=4)
             history = getattr(wf.state, "design_history", [])
             return answer or "", history
         except Exception as e:

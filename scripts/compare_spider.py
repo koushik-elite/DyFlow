@@ -97,7 +97,7 @@ def make_dyflow_t_fn(
             max_tool_retries=2,
         )
         try:
-            answer, trajectory = executor.run(max_steps=8)
+            answer, trajectory = executor.run(max_steps=4)
             history = getattr(executor.state, "design_history", [])
             return answer or "", history
         except Exception as e:

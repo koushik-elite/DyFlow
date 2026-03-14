@@ -83,7 +83,7 @@ def make_workflow_fn(
             save_design_history=True,
             max_tool_retries=2,
         )
-        final_answer, trajectory = executor.run(max_steps=8)
+        final_answer, trajectory = executor.run(max_steps=4)
         design_history = getattr(executor.state, "design_history", [])
         return final_answer, design_history
 
