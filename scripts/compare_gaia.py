@@ -25,7 +25,7 @@ Requirements
 ────────────
     GAIA dataset at benchmarks/data/GAIA/GAIA_validation.json
     Download: https://huggingface.co/datasets/gaia-benchmark/GAIA
-    SERPAPI_API_KEY set in .env for live web search
+    TAVILY_API_KEY set in .env for live web search
 """
 
 import sys
@@ -86,15 +86,16 @@ def make_dyflow_t_fn(designer: ModelService, executor: ModelService):
     Fetches real current information from the web before answering.
     For current-knowledge questions this is grounded and reliable.
     """
-    serpapi_key = os.getenv("SERPAPI_API_KEY", "") or os.getenv("SERPER_API_KEY", "")
+    tavily_key = os.getenv("TAVILY_API_KEY", "")
 
     def build_registry():
         registry = ToolRegistry()
-        if serpapi_key:
-            print(f"  [Tools] WebSearchTool → live (SerpAPI) key=...{serpapi_key[-6:]}")
-            registry.register("WEB_SEARCH", WebSearchTool(api_key=serpapi_key))
+        tavily_key = os.getenv("TAVILY_API_KEY", "")
+        if tavily_key:
+            print(f"  [Tools] WebSearchTool → live (Tavily)")
+            registry.register("WEB_SEARCH", WebSearchTool(api_key=tavily_key))
         else:
-            print("  [Tools] WebSearchTool → mock ⚠  Set SERPAPI_API_KEY for live search")
+            print("  [Tools] WebSearchTool → mock ⚠  Set TAVILY_API_KEY in .env")
             registry.register("WEB_SEARCH", MockWebSearchTool())
         registry.register("SQL_QUERY", MockSQLQueryTool())
         return registry
@@ -199,7 +200,7 @@ def build_report(df_res, dft_res, args, t_df, t_dft) -> dict:
             "size":      args.size or "all",
             "model":     "gemini-2.5-flash",
             "web_search_live": bool(
-                os.getenv("SERPAPI_API_KEY", "") or os.getenv("SERPER_API_KEY", "")
+                os.getenv("TAVILY_API_KEY", "")
             ),
         },
         "summary": {
@@ -245,7 +246,7 @@ def print_report(report: dict) -> None:
     print("\n" + "=" * 68)
     print("GAIA COMPARISON: DyFlow (no tool) vs DyFlow-T (web search)")
     print("=" * 68)
-    print(f"  Web search: {'LIVE (SerpAPI)' if live else '⚠  MOCK (set SERPAPI_API_KEY)'}")
+    print(f"  Web search: {'LIVE (Tavily)' if live else '⚠  MOCK (set TAVILY_API_KEY in .env)'}")
     print(f"{'Metric':<32} {'DyFlow':>14} {'DyFlow-T':>14}")
     print("-" * 68)
     print(f"{'Accuracy':<32} {df['accuracy']:>13.2%} {dft['accuracy']:>13.2%}")
@@ -312,8 +313,8 @@ def run_comparison(args):
     print(f"Mode     : {args.mode}")
     print(f"Size     : {args.size or 'all'}")
     print(f"Workers  : {args.workers}")
-    serpapi_key = os.getenv("SERPAPI_API_KEY", "") or os.getenv("SERPER_API_KEY", "")
-    print(f"Web search: {'live (SerpAPI)' if serpapi_key else '⚠  mock — set SERPAPI_API_KEY'}")
+    tavily_key = os.getenv("TAVILY_API_KEY", "")
+    print(f"Web search: {'live (Tavily)' if os.getenv('TAVILY_API_KEY') else '⚠  mock — set TAVILY_API_KEY in .env'}")
     print("Why GAIA : Current facts the LLM cannot reliably recall")
     print("=" * 68)
 

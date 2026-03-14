@@ -13,7 +13,7 @@ Data:   https://huggingface.co/datasets/YunfanZhang42/LiveNewsBench
 Why this proves the web tool's value:
   DyFlow (no tool):  must recall from parametric memory — post-training
                      events are unknown, producing hallucinated answers
-  DyFlow-T (web):    queries SerpAPI for the specific news event →
+  DyFlow-T (web):    queries Tavily for the specific news event →
                      grounds the answer in real retrieved content
 
 Example:
@@ -305,16 +305,15 @@ def make_dyflow_fn(designer: ModelService, executor: ModelService):
 
 def make_dyflow_t_fn(designer: ModelService, executor: ModelService):
     """
-    DyFlow-T — WebSearchTool via SerpAPI.
+    DyFlow-T — WebSearchTool via Tavily.
     Searches for the specific news event at inference time, then grounds
     the answer in real retrieved content.
     """
-    serpapi_key = os.getenv("SERPAPI_API_KEY", "") or os.getenv("SERPER_API_KEY", "")
-
     def run(question: str):
         registry = ToolRegistry()
-        if serpapi_key:
-            registry.register("WEB_SEARCH", WebSearchTool(api_key=serpapi_key))
+        tavily_key = os.getenv("TAVILY_API_KEY", "")
+        if tavily_key:
+            registry.register("WEB_SEARCH", WebSearchTool(api_key=tavily_key))
         else:
             registry.register("WEB_SEARCH", MockWebSearchTool())
         registry.register("SQL_QUERY", MockSQLQueryTool())
@@ -490,7 +489,7 @@ def build_report(df_res, dft_res, args, t_df, t_dft) -> dict:
         })
 
     delta = dft_sum["accuracy"] - df_sum["accuracy"]
-    serpapi_key = os.getenv("SERPAPI_API_KEY", "") or os.getenv("SERPER_API_KEY", "")
+    tavily_key = os.getenv("TAVILY_API_KEY", "")
 
     return {
         "meta": {
@@ -500,7 +499,7 @@ def build_report(df_res, dft_res, args, t_df, t_dft) -> dict:
             "split":           getattr(args, "split", "sample"),
             "size":            args.size or "all",
             "model":           "gemini-2.5-flash",
-            "web_search_live": bool(serpapi_key),
+            "web_search_live": bool(os.getenv("TAVILY_API_KEY", "")),
         },
         "summary": {
             "dyflow": {
@@ -548,7 +547,7 @@ def print_report(report: dict) -> None:
     print("LiveNewsBench COMPARISON: DyFlow vs DyFlow-T")
     print("=" * 70)
     print(f"  Subset / Split : {subset} / {split}")
-    print(f"  Web search     : {'LIVE (SerpAPI)' if live else '⚠  MOCK — set SERPAPI_API_KEY'}")
+    print(f"  Web search     : {'LIVE (Tavily)' if live else '⚠  MOCK — set TAVILY_API_KEY in .env'}")
     print(f"  Why this bench : Every question requires post-training news retrieval")
     print()
     print(f"{'Metric':<34} {'DyFlow':>14} {'DyFlow-T':>14}")
@@ -647,7 +646,7 @@ def run_comparison(args):
     with open(dataset_path, encoding="utf-8") as f:
         items = json.load(f)
 
-    serpapi_key = os.getenv("SERPAPI_API_KEY", "") or os.getenv("SERPER_API_KEY", "")
+    tavily_key = os.getenv("TAVILY_API_KEY", "")
 
     print("=" * 70)
     print("LiveNewsBench: DyFlow vs DyFlow-T")
@@ -655,7 +654,7 @@ def run_comparison(args):
     print(f"  Dataset : {dataset_path}")
     print(f"  Items   : {len(items)}  |  Size: {args.size or 'all'}")
     print(f"  Workers : {args.workers}")
-    print(f"  Search  : {'live (SerpAPI)' if serpapi_key else '⚠  mock — set SERPAPI_API_KEY'}")
+    print(f"  Search  : {'live (Tavily)' if os.getenv('TAVILY_API_KEY') else '⚠  mock — set TAVILY_API_KEY in .env'}")
     print("=" * 70)
 
     designer = ModelService(model="gemini-2.5-flash")
