@@ -325,10 +325,10 @@ def make_dyflow_t_fn(designer: ModelService, executor: ModelService):
             executor_service=executor,
             tool_registry=registry,
             save_design_history=True,
-            max_tool_retries=2,
+            max_tool_retries=1,
         )
         try:
-            answer, _ = wf.run(max_steps=8)
+            answer, _ = wf.run(max_steps=4)
             history   = getattr(wf.state, "design_history", [])
             return answer or "", history
         except Exception as e:
