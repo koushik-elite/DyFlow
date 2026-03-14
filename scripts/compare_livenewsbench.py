@@ -578,24 +578,32 @@ def print_report(report: dict) -> None:
     print(f"  DyFlow-T only    : {ob['dyflow_t_only']}  ← web search retrieved correct answer")
     print(f"  DyFlow only      : {ob['dyflow_only']}   ← lucky parametric guess")
     print(f"  Both wrong       : {ob['both_wrong']}")
-    print("-" * 70)
-    # Match type breakdown — count + percentage for both systems
-    for label, sys_sum in [("DyFlow", df), ("DyFlow-T", dft)]:
-        mt = sys_sum.get("match_type_counts", {})
-        if not mt:
-            continue
-        total_mt = sum(mt.values())
-        print(f"  {label} match types:")
-        order = ["exact", "contains", "entity_overlap", "token_f1", "llm_judge", "refusal"]
-        all_keys = order + [k for k in mt if k not in order]
+    print("-" * 76)
+    # Match type table — DyFlow vs DyFlow-T side by side
+    df_mt  = df.get("match_type_counts",  {})
+    dft_mt = dft.get("match_type_counts", {})
+    order  = ["exact", "contains", "entity_overlap", "token_f1", "llm_judge", "refusal"]
+    all_keys = order + sorted(set(
+        [k for k in df_mt  if k not in order] +
+        [k for k in dft_mt if k not in order]
+    ))
+    df_total  = sum(df_mt.values())  or 1
+    dft_total = sum(dft_mt.values()) or 1
+    if df_mt or dft_mt:
+        print(f"  {'Match Type':<18} {'DyFlow':>8} {'%':>7}  {'DyFlow-T':>9} {'%':>7}  {'Bar (DyFlow-T)':}")
+        print("  " + "-" * 74)
         for k in all_keys:
-            if k not in mt:
+            df_c  = df_mt.get(k, 0)
+            dft_c = dft_mt.get(k, 0)
+            if df_c == 0 and dft_c == 0:
                 continue
-            count = mt[k]
-            pct   = count / total_mt * 100 if total_mt else 0
-            bar   = "█" * int(pct / 5)  # 1 block per 5%
-            print(f"    {k:<18}: {count:>3}  ({pct:5.1f}%)  {bar}")
-    print("-" * 70)
+            df_p  = df_c  / df_total  * 100
+            dft_p = dft_c / dft_total * 100
+            bar   = "█" * int(dft_p / 5)
+            print(f"  {k:<18} {df_c:>8}  {df_p:>5.1f}%  {dft_c:>9}  {dft_p:>5.1f}%  {bar}")
+        print("  " + "-" * 74)
+        print(f"  {'TOTAL':<18} {df_total:>8}  {'100.0%':>7}  {dft_total:>9}  {'100.0%':>7}")
+    print("-" * 76)
     words, line = report["key_insight"].split(), ""
     for w in words:
         if len(line) + len(w) + 1 > 66:
