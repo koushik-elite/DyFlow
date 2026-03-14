@@ -579,17 +579,22 @@ def print_report(report: dict) -> None:
     print(f"  DyFlow only      : {ob['dyflow_only']}   ← lucky parametric guess")
     print(f"  Both wrong       : {ob['both_wrong']}")
     print("-" * 70)
-    # Match type breakdown for DyFlow-T
-    mt = dft.get("match_type_counts", {})
-    if mt:
-        print("  DyFlow-T match types:")
+    # Match type breakdown — count + percentage for both systems
+    for label, sys_sum in [("DyFlow", df), ("DyFlow-T", dft)]:
+        mt = sys_sum.get("match_type_counts", {})
+        if not mt:
+            continue
+        total_mt = sum(mt.values())
+        print(f"  {label} match types:")
         order = ["exact", "contains", "entity_overlap", "token_f1", "llm_judge", "refusal"]
-        for k in order:
-            if k in mt:
-                print(f"    {k:<18}: {mt[k]}")
-        for k, v in mt.items():
-            if k not in order:
-                print(f"    {k:<18}: {v}")
+        all_keys = order + [k for k in mt if k not in order]
+        for k in all_keys:
+            if k not in mt:
+                continue
+            count = mt[k]
+            pct   = count / total_mt * 100 if total_mt else 0
+            bar   = "█" * int(pct / 5)  # 1 block per 5%
+            print(f"    {k:<18}: {count:>3}  ({pct:5.1f}%)  {bar}")
     print("-" * 70)
     words, line = report["key_insight"].split(), ""
     for w in words:
