@@ -33,8 +33,8 @@ tools:
 
 # ── Workflow ──────────────────────────────────────────────────────────────────
 workflow:
-  max_steps:        7
-  max_tool_retries: 2             # max TOOL_REFINE iterations per failed tool call
+  max_steps:        4
+  max_tool_retries: 1             # max TOOL_REFINE iterations per failed tool call
   save_design_history: true
 
 # ── Benchmarks ────────────────────────────────────────────────────────────────
