@@ -1,316 +1,385 @@
 """
 dyflow/tools/web_search.py
 ──────────────────────────
-WebSearchTool — live web retrieval via SerpAPI Google AI Mode engine.
+WebSearchTool — live web retrieval via Tavily MCP or Tavily REST API.
 
-Uses engine=google_ai_mode which returns a Gemini-2.5-powered AI answer
-grounded in real-time Google search results — ideal for news questions,
-current facts, and post-training knowledge retrieval.
+Primary:  Tavily MCP  → https://mcp.tavily.com/mcp/?tavilyApiKey=<key>
+Fallback: Tavily REST → https://api.tavily.com/search
 
-API docs:   https://serpapi.com/google-ai-mode-api
-Engine:     google_ai_mode
-Response:   text_blocks[] + references[] (no organic_results)
+Tavily MCP is an MCP (Model Context Protocol) server that exposes a
+`tavily-search` tool via JSON-RPC over HTTP. It returns AI-synthesised
+answers grounded in real-time web results — ideal for news questions
+and post-training knowledge retrieval.
+
+MCP endpoint: https://mcp.tavily.com/mcp/?tavilyApiKey=<key>
+REST endpoint: https://api.tavily.com/search
 
 Install:
-    pip install google-search-results
+    pip install requests
 
-Params accepted by execute()
------------------------------
-  query                   : str  — the search string
-  top_k                   : int  — max reference sources to include (default 5)
-  subsequent_request_token: str  — optional token for multi-turn follow-ups
+Environment variables (set one):
+    TAVILY_API_KEY   = tvly-...   (recommended)
+    SERPAPI_API_KEY  = ...        (legacy fallback — SerpAPI google_ai_mode)
+    SERPER_API_KEY   = ...        (legacy compat)
+
+Usage in .env:
+    TAVILY_API_KEY=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
 """
 
 from __future__ import annotations
 
 import os
+import json
 import requests
 from typing import Any, Dict, List, Optional
 
 from .base import BaseTool, ToolResult, ToolStatus
 
 
-# ── Response parsing ───────────────────────────────────────────────────────────
+# ── Constants ──────────────────────────────────────────────────────────────────
+TAVILY_MCP_BASE  = "https://mcp.tavily.com/mcp/"
+TAVILY_REST_URL  = "https://api.tavily.com/search"
+SERPAPI_URL      = "https://serpapi.com/search"
 
-def _extract_text_blocks(data: Dict) -> str:
-    """
-    Flatten google_ai_mode text_blocks into a readable string.
 
-    text_blocks is a list of dicts with fields:
-      type    : "paragraph" | "heading" | "list" | "code" | ...
-      snippet : the text content
-      title   : optional heading for list/expandable blocks
+# ── Response formatters ────────────────────────────────────────────────────────
+
+def _format_tavily_results(data: Dict, top_k: int) -> tuple:
     """
+    Parse Tavily response (MCP tool_result or REST response).
+    Returns (ai_answer: str, references: list, raw_output: str)
+    """
+    # MCP tool_result wraps content inside content[].text as JSON string
+    # REST returns directly as JSON dict
+    results = data.get("results", [])
+    ai_answer = data.get("answer", "")
+
+    references = []
+    for i, r in enumerate(results[:top_k]):
+        references.append({
+            "position": i + 1,
+            "title":    r.get("title",   ""),
+            "link":     r.get("url",     r.get("link", "")),
+            "snippet":  r.get("content", r.get("snippet", "")),
+            "score":    r.get("score",   0),
+        })
+
+    parts = []
+    if ai_answer:
+        parts.append("=== Tavily AI Answer ===")
+        parts.append(ai_answer)
+    if references:
+        parts.append("\n=== Sources ===")
+        for ref in references:
+            title   = ref["title"]   or "(no title)"
+            link    = ref["link"]    or ""
+            snippet = ref["snippet"] or ""
+            parts.append(f"[{ref['position']}] {title}\n    URL: {link}\n    {snippet[:200]}")
+
+    return ai_answer, references, "\n".join(parts)
+
+
+def _format_serpapi_results(data: Dict, top_k: int) -> tuple:
+    """Parse SerpAPI google_ai_mode response."""
     lines = []
     for block in data.get("text_blocks", []):
         btype   = block.get("type", "paragraph")
         snippet = block.get("snippet", "")
         title   = block.get("title", "")
-
         if btype == "heading":
             lines.append(f"\n### {snippet or title}")
         elif btype == "list":
-            if title:
-                lines.append(f"\n{title}:")
+            if title: lines.append(f"\n{title}:")
             for item in block.get("list", []):
                 s = item.get("snippet", item) if isinstance(item, dict) else str(item)
                 lines.append(f"  - {s}")
-        elif btype in ("paragraph", "expandable"):
-            if title:
-                lines.append(f"\n{title}")
-            if snippet:
-                lines.append(snippet)
-        elif btype == "code":
-            lines.append(f"```\n{snippet}\n```")
         else:
-            if snippet:
-                lines.append(snippet)
+            if snippet: lines.append(snippet)
+    ai_answer = "\n".join(lines).strip()
 
-    return "\n".join(lines).strip()
-
-
-def _extract_references(data: Dict, top_k: int) -> List[Dict]:
-    """
-    Extract reference sources from the google_ai_mode response.
-
-    References are listed under the 'references' key as:
-      [{ title, link, snippet, source }, ...]
-    """
     refs = data.get("references", [])
-    results = []
-    for i, ref in enumerate(refs[:top_k]):
-        results.append({
-            "position": i + 1,
-            "title":    ref.get("title",   ""),
-            "link":     ref.get("link",    ref.get("url", "")),
-            "snippet":  ref.get("snippet", ref.get("description", "")),
-            "source":   ref.get("source",  ""),
-        })
-    return results
+    references = [
+        {"position": i+1, "title": r.get("title",""), "link": r.get("link",""),
+         "snippet": r.get("snippet",""), "source": r.get("source","")}
+        for i, r in enumerate(refs[:top_k])
+    ]
+
+    parts = []
+    if ai_answer:
+        parts.append("=== Google AI Mode Answer ===")
+        parts.append(ai_answer)
+    if references:
+        parts.append("\n=== Sources ===")
+        for ref in references:
+            label = f"{ref['title']} ({ref.get('source','')})" if ref.get('source') else ref['title']
+            parts.append(f"[{ref['position']}] {label}\n    URL: {ref['link']}\n    {ref['snippet'][:200]}")
+
+    return ai_answer, references, "\n".join(parts)
 
 
-def _format_references(refs: List[Dict]) -> str:
-    lines = []
-    for r in refs:
-        title   = r.get("title",   "(no title)")
-        link    = r.get("link",    "")
-        snippet = r.get("snippet", "")
-        source  = r.get("source",  "")
-        label   = f"{title} ({source})" if source else title
-        lines.append(f"[{r['position']}] {label}\n    URL: {link}\n    {snippet}")
-    return "\n\n".join(lines)
-
-
-# ── Live tool — google_ai_mode ────────────────────────────────────────────────
+# ── Live WebSearchTool ─────────────────────────────────────────────────────────
 
 class WebSearchTool(BaseTool):
     """
-    Retrieves answers from SerpAPI's Google AI Mode engine.
+    Live web search tool supporting:
+      1. Tavily MCP   (primary)   — MCP JSON-RPC over HTTP
+      2. Tavily REST  (fallback)  — direct REST API
+      3. SerpAPI      (legacy)    — google_ai_mode engine
 
-    Google AI Mode (powered by Gemini 2.5) returns a structured AI answer
-    grounded in real-time Google search — longer, more detailed, and more
-    accurate for current-knowledge questions than standard organic results.
-
-    The tool output combines:
-      1. AI-generated answer text (from text_blocks)
-      2. Reference sources (title, URL, snippet) used to ground the answer
+    Priority: TAVILY_API_KEY → SERPAPI_API_KEY / SERPER_API_KEY
 
     Parameters
     ----------
-    api_key   : SerpAPI key — falls back to SERPAPI_API_KEY env var
-    top_k     : max reference sources to include in output (default 5)
-    engine    : SerpAPI engine to use (default: google_ai_mode)
-
-    Requirements
-    ------------
-        pip install requests
+    api_key : str, optional — override env var lookup
+    top_k   : int           — max results to return (default 5)
     """
 
-    tool_name  = "WEB_SEARCH"
-    SERPAPI_URL = "https://serpapi.com/search"
+    tool_name   = "WEB_SEARCH"
 
     def __init__(
         self,
         api_key: Optional[str] = None,
         top_k: int = 5,
-        engine: str = "google_ai_mode",
     ) -> None:
-        self.api_key = (
+        # Tavily key (primary)
+        self.tavily_key = (
             api_key
-            or os.getenv("SERPAPI_API_KEY", "")
-            or os.getenv("SERPER_API_KEY", "")   # backward compat
+            or os.getenv("TAVILY_API_KEY", "")
+        )
+        # SerpAPI key (legacy fallback)
+        self.serpapi_key = (
+            os.getenv("SERPAPI_API_KEY", "")
+            or os.getenv("SERPER_API_KEY", "")
         )
         self.default_k = top_k
-        self.engine    = engine
+
+    # ── Public ────────────────────────────────────────────────────────────────
 
     def execute(self, params: Dict[str, Any]) -> ToolResult:
         query = params.get("query", "").strip().strip("`").strip()
         top_k = int(params.get("top_k", self.default_k))
-        subsequent_token = params.get("subsequent_request_token", "")
 
         if not query:
             return ToolResult(
-                status=ToolStatus.ERROR,
-                raw_output="",
-                tool_name=self.tool_name,
-                query=query,
+                status=ToolStatus.ERROR, raw_output="",
+                tool_name=self.tool_name, query=query,
                 error_message="Empty query string.",
             )
 
-        if not self.api_key:
-            return ToolResult(
-                status=ToolStatus.ERROR,
-                raw_output="",
-                tool_name=self.tool_name,
-                query=query,
-                error_message=(
-                    "SERPAPI_API_KEY is not set. "
-                    "Use MockWebSearchTool for offline testing."
-                ),
-            )
+        if self.tavily_key:
+            # Try MCP first, then REST
+            result = self._tavily_mcp(query, top_k)
+            if result.status == ToolStatus.ERROR:
+                print(f"  [Tavily MCP] failed, trying REST: {result.error_message}")
+                result = self._tavily_rest(query, top_k)
+            return result
 
-        # ── Build request params ───────────────────────────────────────────────
-        req_params: Dict[str, Any] = {
-            "engine":  self.engine,
-            "q":       query,
-            "api_key": self.api_key,
-            "output":  "json",
+        if self.serpapi_key:
+            return self._serpapi(query, top_k)
+
+        return ToolResult(
+            status=ToolStatus.ERROR, raw_output="",
+            tool_name=self.tool_name, query=query,
+            error_message=(
+                "No API key found. Set TAVILY_API_KEY in your .env file.\n"
+                "  Get a free key at: https://tavily.com (1000 searches/month)\n"
+                "  echo \"TAVILY_API_KEY=tvly-...\" >> .env"
+            ),
+        )
+
+    # ── Tavily MCP ─────────────────────────────────────────────────────────────
+
+    def _tavily_mcp(self, query: str, top_k: int) -> ToolResult:
+        """
+        Call Tavily MCP server via JSON-RPC 2.0.
+
+        MCP endpoint: POST https://mcp.tavily.com/mcp/?tavilyApiKey=<key>
+        Method: tools/call
+        Tool:   tavily-search
+        """
+        url = f"{TAVILY_MCP_BASE}?tavilyApiKey={self.tavily_key}"
+        payload = {
+            "jsonrpc": "2.0",
+            "id":      1,
+            "method":  "tools/call",
+            "params":  {
+                "name":      "tavily-search",
+                "arguments": {
+                    "query":              query,
+                    "max_results":        top_k,
+                    "include_answer":     True,
+                    "include_raw_content": False,
+                    "search_depth":       "advanced",
+                },
+            },
         }
-        if subsequent_token:
-            req_params["subsequent_request_token"] = subsequent_token
-
-        # ── Call SerpAPI ───────────────────────────────────────────────────────
         try:
-            resp = requests.get(self.SERPAPI_URL, params=req_params, timeout=30)
+            resp = requests.post(
+                url, json=payload,
+                headers={"Content-Type": "application/json"},
+                timeout=30,
+            )
             resp.raise_for_status()
-            data = resp.json()
+            rjson = resp.json()
         except requests.exceptions.Timeout:
-            return ToolResult(
-                status=ToolStatus.ERROR,
-                raw_output="",
-                tool_name=self.tool_name,
-                query=query,
-                error_message="SerpAPI request timed out (30s).",
-            )
-        except requests.exceptions.RequestException as exc:
-            return ToolResult(
-                status=ToolStatus.ERROR,
-                raw_output="",
-                tool_name=self.tool_name,
-                query=query,
-                error_message=f"SerpAPI HTTP error: {exc}",
-            )
-        except ValueError as exc:
-            return ToolResult(
-                status=ToolStatus.ERROR,
-                raw_output="",
-                tool_name=self.tool_name,
-                query=query,
-                error_message=f"SerpAPI JSON parse error: {exc}",
-            )
+            return ToolResult(status=ToolStatus.ERROR, raw_output="",
+                              tool_name=self.tool_name, query=query,
+                              error_message="Tavily MCP timeout (30s).")
+        except Exception as exc:
+            return ToolResult(status=ToolStatus.ERROR, raw_output="",
+                              tool_name=self.tool_name, query=query,
+                              error_message=f"Tavily MCP error: {exc}")
 
-        print(f"  [SerpAPI/{self.engine}] Response keys: {list(data.keys())}")
+        # MCP JSON-RPC error
+        if "error" in rjson:
+            return ToolResult(status=ToolStatus.ERROR, raw_output="",
+                              tool_name=self.tool_name, query=query,
+                              error_message=f"MCP error: {rjson['error']}")
 
-        # ── API-level error ────────────────────────────────────────────────────
-        if "error" in data:
-            return ToolResult(
-                status=ToolStatus.ERROR,
-                raw_output="",
-                tool_name=self.tool_name,
-                query=query,
-                error_message=f"SerpAPI error: {data['error']}",
-            )
+        # Extract result — MCP returns content as list of {type, text}
+        result_obj = rjson.get("result", {})
+        content    = result_obj.get("content", [])
+        raw_text   = ""
+        for block in content:
+            if block.get("type") == "text":
+                raw_text = block.get("text", "")
+                break
 
-        # ── Extract AI answer text ─────────────────────────────────────────────
-        ai_text    = _extract_text_blocks(data)
-        references = _extract_references(data, top_k)
+        # Parse the JSON string inside the text block
+        try:
+            data = json.loads(raw_text) if raw_text else {}
+        except (json.JSONDecodeError, TypeError):
+            # Sometimes raw_text IS the answer directly
+            data = {"answer": raw_text, "results": []}
 
-        print(f"  [SerpAPI/{self.engine}] text_blocks: {len(data.get('text_blocks', []))}  |  references: {len(references)}")
+        print(f"  [Tavily MCP] query='{query[:50]}' | results={len(data.get('results', []))}")
 
-        if not ai_text and not references:
-            print(f"  [SerpAPI/{self.engine}] WARNING: empty response. Keys: {list(data.keys())}")
-            return ToolResult(
-                status=ToolStatus.EMPTY,
-                raw_output="Google AI Mode returned no content for this query.",
-                tool_name=self.tool_name,
-                query=query,
-            )
+        ai_answer, references, raw_output = _format_tavily_results(data, top_k)
 
-        # ── Compose final output ───────────────────────────────────────────────
-        parts = []
-        if ai_text:
-            parts.append("=== Google AI Mode Answer ===")
-            parts.append(ai_text)
-        if references:
-            parts.append("\n=== Sources ===")
-            parts.append(_format_references(references))
-
-        raw_output = "\n".join(parts)
-
-        # subsequent_request_token enables multi-turn follow-up queries
-        next_token = data.get("subsequent_request_token", "")
-        if next_token:
-            print(f"  [SerpAPI/{self.engine}] subsequent_request_token available for follow-up")
+        if not ai_answer and not references:
+            return ToolResult(status=ToolStatus.EMPTY,
+                              raw_output="Tavily MCP returned no content.",
+                              tool_name=self.tool_name, query=query)
 
         return ToolResult(
             status=ToolStatus.SUCCESS,
             raw_output=raw_output,
             tool_name=self.tool_name,
             query=query,
-            structured={
-                "ai_answer":   ai_text,
-                "references":  references,
-                "text_blocks": data.get("text_blocks", []),
-            },
-            metadata={
-                "engine":                   self.engine,
-                "subsequent_request_token": next_token,
-                "search_metadata":          data.get("search_metadata", {}),
-            },
+            structured={"ai_answer": ai_answer, "references": references},
+            metadata={"engine": "tavily_mcp"},
+        )
+
+    # ── Tavily REST ────────────────────────────────────────────────────────────
+
+    def _tavily_rest(self, query: str, top_k: int) -> ToolResult:
+        """
+        Tavily REST API fallback.
+        POST https://api.tavily.com/search
+        """
+        payload = {
+            "api_key":        self.tavily_key,
+            "query":          query,
+            "max_results":    top_k,
+            "include_answer": True,
+            "search_depth":   "advanced",
+        }
+        try:
+            resp = requests.post(TAVILY_REST_URL, json=payload, timeout=30)
+            resp.raise_for_status()
+            data = resp.json()
+        except requests.exceptions.Timeout:
+            return ToolResult(status=ToolStatus.ERROR, raw_output="",
+                              tool_name=self.tool_name, query=query,
+                              error_message="Tavily REST timeout (30s).")
+        except Exception as exc:
+            return ToolResult(status=ToolStatus.ERROR, raw_output="",
+                              tool_name=self.tool_name, query=query,
+                              error_message=f"Tavily REST error: {exc}")
+
+        if "error" in data:
+            return ToolResult(status=ToolStatus.ERROR, raw_output="",
+                              tool_name=self.tool_name, query=query,
+                              error_message=f"Tavily error: {data['error']}")
+
+        print(f"  [Tavily REST] query='{query[:50]}' | results={len(data.get('results', []))}")
+
+        ai_answer, references, raw_output = _format_tavily_results(data, top_k)
+
+        if not ai_answer and not references:
+            return ToolResult(status=ToolStatus.EMPTY,
+                              raw_output="Tavily returned no content.",
+                              tool_name=self.tool_name, query=query)
+
+        return ToolResult(
+            status=ToolStatus.SUCCESS,
+            raw_output=raw_output,
+            tool_name=self.tool_name,
+            query=query,
+            structured={"ai_answer": ai_answer, "references": references},
+            metadata={"engine": "tavily_rest"},
+        )
+
+    # ── SerpAPI legacy ─────────────────────────────────────────────────────────
+
+    def _serpapi(self, query: str, top_k: int) -> ToolResult:
+        """SerpAPI google_ai_mode — legacy fallback if no Tavily key."""
+        req_params = {
+            "engine": "google_ai_mode", "q": query,
+            "api_key": self.serpapi_key, "output": "json",
+        }
+        try:
+            resp = requests.get(SERPAPI_URL, params=req_params, timeout=30)
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception as exc:
+            return ToolResult(status=ToolStatus.ERROR, raw_output="",
+                              tool_name=self.tool_name, query=query,
+                              error_message=f"SerpAPI error: {exc}")
+
+        if "error" in data:
+            return ToolResult(status=ToolStatus.ERROR, raw_output="",
+                              tool_name=self.tool_name, query=query,
+                              error_message=f"SerpAPI: {data['error']}")
+
+        ai_answer, references, raw_output = _format_serpapi_results(data, top_k)
+        print(f"  [SerpAPI] text_blocks={len(data.get('text_blocks', []))} | refs={len(references)}")
+
+        if not ai_answer and not references:
+            return ToolResult(status=ToolStatus.EMPTY,
+                              raw_output="SerpAPI returned no content.",
+                              tool_name=self.tool_name, query=query)
+
+        return ToolResult(
+            status=ToolStatus.SUCCESS,
+            raw_output=raw_output,
+            tool_name=self.tool_name,
+            query=query,
+            structured={"ai_answer": ai_answer, "references": references},
+            metadata={"engine": "serpapi_google_ai_mode"},
         )
 
 
 # ── Offline stub ──────────────────────────────────────────────────────────────
 
 class MockWebSearchTool(BaseTool):
-    """
-    Returns deterministic fake AI Mode results.
-    Useful for unit tests and local development without a live API key.
-    """
+    """Deterministic fake results for offline testing / CI."""
 
     tool_name = "WEB_SEARCH"
 
     def execute(self, params: Dict[str, Any]) -> ToolResult:
         query = params.get("query", "(empty)")
-        ai_text = (
-            f"=== Google AI Mode Answer ===\n"
-            f"Based on current information, here is a synthesised answer for: '{query}'.\n"
-            f"This is a mock response generated for offline testing. "
-            f"In production, the Google AI Mode engine returns a real "
-            f"Gemini-2.5-powered answer grounded in live Google search results."
-        )
-        refs = [
-            {
-                "position": 1,
-                "title":    f"Mock Source 1 for: {query}",
-                "link":     "https://example.com/1",
-                "snippet":  f"Mock snippet describing context for '{query}'.",
-                "source":   "example.com",
-            },
-            {
-                "position": 2,
-                "title":    f"Mock Source 2 for: {query}",
-                "link":     "https://example.com/2",
-                "snippet":  f"Another mock source with additional context.",
-                "source":   "example.com",
-            },
+        refs  = [
+            {"position": 1, "title": f"Mock Source for: {query}",
+             "link": "https://example.com/1", "snippet": f"Mock result for '{query}'.", "score": 0.9},
         ]
-        ref_text = "\n\n=== Sources ===\n" + _format_references(refs)
+        ai_answer   = f"Based on current sources, here is information about: {query}. [MOCK]"
+        raw_output  = f"=== Tavily AI Answer ===\n{ai_answer}\n\n=== Sources ===\n[1] {refs[0]['title']}"
         return ToolResult(
             status=ToolStatus.SUCCESS,
-            raw_output=ai_text + ref_text,
+            raw_output=raw_output,
             tool_name=self.tool_name,
             query=query,
-            structured={"ai_answer": ai_text, "references": refs, "text_blocks": []},
-            metadata={"mock": True, "engine": "google_ai_mode"},
+            structured={"ai_answer": ai_answer, "references": refs},
+            metadata={"mock": True, "engine": "mock"},
         )
