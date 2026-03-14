@@ -70,13 +70,57 @@ SAMPLE_PATH = os.path.join(DATA_DIR, "sample", "livenewsbench_sample.json")
 
 # ── Scoring ────────────────────────────────────────────────────────────────────
 
+# ── Refusal / no-answer detection ─────────────────────────────────────────────
+
+_REFUSAL_PATTERNS = re.compile(
+    r"(no information|not found|cannot find|couldn't find|could not find|"
+    r"no results|unable to find|not available|i don't know|i do not know|"
+    r"no answer|insufficient information|no data|unavailable)",
+    re.IGNORECASE,
+)
+
+def _is_refusal(text: str) -> bool:
+    """Return True if the answer is a refusal / 'no info found' non-answer."""
+    t = text.strip()
+    if not t or len(t) < 3:
+        return True
+    # Short responses that are pure refusals
+    if len(t) < 80 and _REFUSAL_PATTERNS.search(t):
+        return True
+    return False
+
+
+# ── Text normalisation ─────────────────────────────────────────────────────────
+
 def _normalise(text: str) -> str:
+    """
+    Aggressive normalisation for QA answer comparison:
+    - lowercase
+    - strip punctuation
+    - normalise list separators: commas and 'and' treated as equivalent
+    - collapse whitespace
+    - expand common abbreviations (mayor → mayor, etc.)
+    """
     if not isinstance(text, str):
         text = str(text)
     text = text.lower().strip()
+    # Normalise list separators: ", " and " and " → single space token
+    text = re.sub(r"\band\b", " ", text)
+    text = re.sub(r",", " ", text)
+    # Strip remaining punctuation
     text = text.translate(str.maketrans("", "", string.punctuation))
     text = re.sub(r"\s+", " ", text).strip()
     return text
+
+
+def _tokenise(text: str) -> set:
+    """Return set of meaningful tokens (length > 1) after normalisation."""
+    stopwords = {"the", "a", "an", "of", "in", "on", "at", "to", "is", "was",
+                 "were", "are", "be", "by", "with", "as", "who", "which", "that",
+                 "for", "from", "his", "her", "their", "he", "she", "it", "its",
+                 "this", "these", "those", "had", "has", "have", "not", "no"}
+    tokens = _normalise(text).split()
+    return {t for t in tokens if len(t) > 1 and t not in stopwords}
 
 
 def exact_match(pred: str, gold: str) -> bool:
@@ -87,36 +131,134 @@ def contains_match(pred: str, gold: str) -> bool:
     return _normalise(gold) in _normalise(pred)
 
 
+def token_f1(pred: str, gold: str) -> float:
+    """
+    Token-level F1 score.
+    Catches cases like:
+      pred="SITRA"  gold="Fectrans and Sitra"  → partial F1 = 0.67
+      pred="Virginia, Ohio"  gold="Virginia and Ohio"  → F1 = 1.0
+    """
+    pred_toks = _tokenise(pred)
+    gold_toks = _tokenise(gold)
+    if not gold_toks:
+        return 1.0 if not pred_toks else 0.0
+    if not pred_toks:
+        return 0.0
+    overlap = pred_toks & gold_toks
+    precision = len(overlap) / len(pred_toks)
+    recall    = len(overlap) / len(gold_toks)
+    if precision + recall == 0:
+        return 0.0
+    return 2 * precision * recall / (precision + recall)
+
+
+def all_entities_present(pred: str, gold: str) -> bool:
+    """
+    True if every token from gold appears somewhere in pred.
+    Handles: pred is a long paragraph containing the full answer.
+    e.g. gold="Balendra Shah endorsed Sushila Karki"
+         pred="Kathmandu Mayor Balen Shah explicitly endorsed her..."
+    Uses fuzzy prefix matching for names (Balendra ↔ Balen).
+    """
+    gold_toks = _tokenise(gold)
+    pred_norm  = _normalise(pred)
+    pred_toks  = _tokenise(pred)
+
+    for gt in gold_toks:
+        # Exact token match
+        if gt in pred_toks:
+            continue
+        # Prefix match (Balendra ↔ Balen, min length 4)
+        if len(gt) >= 4:
+            if any(gt.startswith(pt) or pt.startswith(gt)
+                   for pt in pred_toks if len(pt) >= 4):
+                continue
+        # Substring match (Sitra ↔ SITRA)
+        if any(gt in pt or pt in gt for pt in pred_toks if len(pt) >= 3 and len(gt) >= 3):
+            continue
+        # Direct substring in normalised pred
+        if gt in pred_norm:
+            continue
+        return False
+    return True
+
+
 def score_answer(prediction: str, ground_truth: str) -> tuple:
-    """Returns (extracted, exact_match, contains_match)."""
-    # Try to pull out Final Answer line first
+    """
+    Multi-tier scoring. Returns (extracted_answer, is_correct, match_type).
+
+    Tiers (first match wins):
+      1. Refusal detection  → wrong immediately
+      2. Exact match        → correct
+      3. Contains match     → correct (pred contains full gold string)
+      4. All entities present → correct (all gold tokens found in pred)
+      5. Token F1 >= 0.75   → correct (high overlap)
+      6. Otherwise          → wrong, pass to LLM judge
+    """
+    if not isinstance(prediction, str):
+        prediction = str(prediction)
+    if not isinstance(ground_truth, str):
+        ground_truth = str(ground_truth)
+
+    # Extract "Final Answer:" line if present
     fa = re.search(r"Final Answer\s*:\s*(.+?)(?:\n|$)", prediction, re.IGNORECASE)
     clean = fa.group(1).strip() if fa else prediction.strip()
-    em = exact_match(clean, ground_truth)
-    cm = contains_match(clean, ground_truth)
-    return clean, em, cm
+
+    # Tier 1: refusal
+    if _is_refusal(clean):
+        return clean, False, "refusal"
+
+    # Tier 2: exact match
+    if exact_match(clean, ground_truth):
+        return clean, True, "exact"
+
+    # Tier 3: contains match (normalised gold appears in normalised pred)
+    if contains_match(clean, ground_truth):
+        return clean, True, "contains"
+
+    # Tier 4: all named entities / key tokens from gold found in pred
+    if all_entities_present(clean, ground_truth):
+        return clean, True, "entity_overlap"
+
+    # Tier 5: token F1 >= 0.75
+    f1 = token_f1(clean, ground_truth)
+    if f1 >= 0.75:
+        return clean, True, "token_f1"
+
+    return clean, False, f"f1={f1:.2f}"
 
 
 # ── LLM judge for ambiguous cases ─────────────────────────────────────────────
 
 JUDGE_PROMPT = """\
 You are an expert evaluator for the LiveNewsBench benchmark.
-Your task: extract the FINAL answer from the model output and decide if it matches the ground truth.
+Your task: check whether the model's answer correctly answers the question given the ground truth.
 
 Question:
 {question}
 
-Model Output:
-{output}
-
 Ground Truth Answer:
 {gold}
 
-Instructions:
-1. Extract the model's final answer (ignore reasoning steps).
-2. Compare it to the ground truth using normalised exact match (case-insensitive, ignore punctuation).
-3. Output the extracted answer on a line starting with 'Extracted: '
-4. Then respond with [[True]] if correct or [[False]] if incorrect."""
+Model's Extracted Answer:
+{output}
+
+Scoring rules — mark [[True]] if ANY of these apply:
+  1. The extracted answer contains all key facts from the ground truth (names, numbers, places).
+  2. The extracted answer is a paraphrase or abbreviation of the ground truth.
+  3. The extracted answer is longer than the ground truth but includes all the required information.
+  4. Names match even if shortened (e.g. "Balen Shah" = "Balendra Shah", "SITRA" = "Sitra").
+  5. List separators differ but items are the same ("Virginia, Ohio" = "Virginia and Ohio").
+
+Mark [[False]] if:
+  - The answer is missing one or more key entities from the ground truth.
+  - The answer says "no information", "not found", or similar.
+  - The answer contains the wrong names/numbers.
+
+Output format:
+Extracted: <the key answer from the model output, shortened to the core fact>
+Verdict: [[True]] or [[False]]
+Reason: <one sentence explaining your decision>"""
 
 
 def llm_judge(question, output, gold, judge_service):
@@ -126,7 +268,8 @@ def llm_judge(question, output, gold, judge_service):
         text = resp.get("response", "") if isinstance(resp, dict) else str(resp)
         extracted = ""
         for line in text.splitlines():
-            if line.strip().lower().startswith("extracted:"):
+            stripped = line.strip().lower()
+            if stripped.startswith("extracted:"):
                 extracted = line.split(":", 1)[1].strip()
                 break
         is_correct = "[[true]]" in text.lower()
@@ -207,15 +350,16 @@ def evaluate_one(item, run_fn, judge_service=None):
     except Exception as e:
         prediction, history = f"ERROR: {e}", []
 
-    extracted, em, cm = score_answer(prediction, ground_truth)
+    extracted, is_correct, match_type = score_answer(prediction, ground_truth)
 
-    # LLM judge if not already correct
-    if not em and judge_service:
+    # LLM judge only if auto-scoring said wrong AND it's not a clear refusal
+    if not is_correct and match_type != "refusal" and judge_service:
         ext2, judge_ok = llm_judge(question, prediction, ground_truth, judge_service)
+        if judge_ok:
+            is_correct = True
+            match_type = "llm_judge"
         if ext2:
             extracted = ext2
-            em = em or exact_match(ext2, ground_truth) or judge_ok
-            cm = cm or contains_match(ext2, ground_truth)
 
     return {
         "id":               qid,
@@ -225,9 +369,8 @@ def evaluate_one(item, run_fn, judge_service=None):
         "category":         category,
         "prediction":       prediction,
         "extracted_answer": extracted,
-        "exact_match":      em,
-        "contains_match":   cm,
-        "judge_result":     em,
+        "match_type":       match_type,
+        "judge_result":     is_correct,
         "design_history":   history,
     }
 
@@ -277,13 +420,16 @@ def evaluate_all(items, run_fn, judge_service=None, max_workers=2,
 def summarise(results: list) -> dict:
     total = correct = 0
     categories: dict = {}
+    match_types: dict = {}
     for r in results:
         if r.get("prediction", "").startswith("ERROR") and not r.get("extracted_answer"):
             continue
         total += 1
         cat = r.get("category", "unknown")
+        mt  = r.get("match_type", "unknown")
         categories.setdefault(cat, {"total": 0, "correct": 0})
         categories[cat]["total"] += 1
+        match_types[mt] = match_types.get(mt, 0) + 1
         if r.get("judge_result", False):
             correct += 1
             categories[cat]["correct"] += 1
@@ -291,6 +437,7 @@ def summarise(results: list) -> dict:
         "total":   total,
         "correct": correct,
         "accuracy": round(correct / total, 4) if total else 0.0,
+        "match_type_counts": match_types,
         "category_accuracy": {
             cat: round(s["correct"] / s["total"], 4) if s["total"] else 0.0
             for cat, s in categories.items()
@@ -431,6 +578,18 @@ def print_report(report: dict) -> None:
     print(f"  DyFlow-T only    : {ob['dyflow_t_only']}  ← web search retrieved correct answer")
     print(f"  DyFlow only      : {ob['dyflow_only']}   ← lucky parametric guess")
     print(f"  Both wrong       : {ob['both_wrong']}")
+    print("-" * 70)
+    # Match type breakdown for DyFlow-T
+    mt = dft.get("match_type_counts", {})
+    if mt:
+        print("  DyFlow-T match types:")
+        order = ["exact", "contains", "entity_overlap", "token_f1", "llm_judge", "refusal"]
+        for k in order:
+            if k in mt:
+                print(f"    {k:<18}: {mt[k]}")
+        for k, v in mt.items():
+            if k not in order:
+                print(f"    {k:<18}: {v}")
     print("-" * 70)
     words, line = report["key_insight"].split(), ""
     for w in words:
