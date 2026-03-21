@@ -700,6 +700,83 @@ def run_comparison(args):
     print(f"\nReport → {report_path}")
 
 
+def report_from_temp(args):
+    """
+    Read existing temp result JSON files and generate a report without re-running.
+
+    Looks for:
+      temp_{tag}_dyflow.json
+      temp_{tag}_dyflow_t.json
+
+    Usage:
+      python scripts/compare_livenewsbench.py --from-temp
+      python scripts/compare_livenewsbench.py --from-temp --subset sep_2025 --split val
+      python scripts/compare_livenewsbench.py --from-temp --df-file path/to/dyflow.json --dft-file path/to/dyflow_t.json
+    """
+    os.makedirs(REPORT_DIR, exist_ok=True)
+
+    # ── Resolve file paths ─────────────────────────────────────────────────────
+    if args.df_file and args.dft_file:
+        df_path  = args.df_file
+        dft_path = args.dft_file
+        tag = os.path.splitext(os.path.basename(df_path))[0].replace("temp_", "").replace("_dyflow", "")
+    else:
+        if args.sample:
+            tag = "sample"
+        else:
+            tag = f"{args.subset}_{args.split}"
+        df_path  = os.path.join(REPORT_DIR, f"temp_{tag}_dyflow.json")
+        dft_path = os.path.join(REPORT_DIR, f"temp_{tag}_dyflow_t.json")
+
+    # ── Load ───────────────────────────────────────────────────────────────────
+    missing = []
+    if not os.path.exists(df_path):
+        missing.append(df_path)
+    if not os.path.exists(dft_path):
+        missing.append(dft_path)
+
+    if missing:
+        print("[ERROR] Missing result files:")
+        for m in missing:
+            print(f"  {m}")
+        print()
+        print("Run the full comparison first:")
+        if args.sample:
+            print("  python scripts/compare_livenewsbench.py --sample")
+        else:
+            print(f"  python scripts/compare_livenewsbench.py --subset {args.subset} --split {args.split}")
+        sys.exit(1)
+
+    print(f"[from-temp] Loading DyFlow    : {df_path}")
+    print(f"[from-temp] Loading DyFlow-T  : {dft_path}")
+
+    df_results  = json.load(open(df_path,  encoding="utf-8"))
+    dft_results = json.load(open(dft_path, encoding="utf-8"))
+
+    print(f"[from-temp] DyFlow    : {len(df_results)} results")
+    print(f"[from-temp] DyFlow-T  : {len(dft_results)} results")
+
+    # ── Build and save report ──────────────────────────────────────────────────
+    class _Args:
+        pass
+    fake_args = _Args()
+    fake_args.subset = getattr(args, "subset", "sep_2025")
+    fake_args.split  = getattr(args, "split",  "val")
+    fake_args.size   = getattr(args, "size",   None)
+    fake_args.sample = getattr(args, "sample", False)
+
+    report = build_report(df_results, dft_results, fake_args, t_df=0.0, t_dft=0.0)
+    report["meta"]["source"] = "loaded from temp files (no re-run)"
+
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    report_path = os.path.join(REPORT_DIR, f"comparison_{tag}_{ts}.json")
+    with open(report_path, "w", encoding="utf-8") as f:
+        json.dump(report, f, indent=2, ensure_ascii=False)
+
+    print_report(report)
+    print(f"\nReport → {report_path}")
+
+
 def show_latest(args):
     if not os.path.isdir(REPORT_DIR):
         print("[ERROR] No reports found. Run the comparison first.")
@@ -736,9 +813,17 @@ if __name__ == "__main__":
                    help="Clear cached temp files and re-run from scratch")
     p.add_argument("--report-only", action="store_true",
                    help="Print metrics from last saved report")
+    p.add_argument("--from-temp", action="store_true",
+                   help="Build report from existing temp JSON files — no re-run")
+    p.add_argument("--df-file", type=str, default=None,
+                   help="Path to DyFlow temp result JSON (overrides auto-detect)")
+    p.add_argument("--dft-file", type=str, default=None,
+                   help="Path to DyFlow-T temp result JSON (overrides auto-detect)")
     args = p.parse_args()
 
     if args.report_only:
         show_latest(args)
+    elif args.from_temp:
+        report_from_temp(args)
     else:
         run_comparison(args)
