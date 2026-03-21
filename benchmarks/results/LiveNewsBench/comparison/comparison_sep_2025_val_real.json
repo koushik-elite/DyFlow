@@ -1,0 +1,58 @@
+{
+  "meta": {
+    "subset": "sep_2025",
+    "split": "val",
+    "web_search": "LIVE (Tavily)",
+    "source": "real experimental run",
+    "note": "Every question requires post-training news retrieval"
+  },
+  "summary": {
+    "dyflow": {
+      "accuracy_pct": 1.32,
+      "correct": 1,
+      "total": 76,
+      "elapsed_sec": 0.0
+    },
+    "dyflow_t": {
+      "accuracy_pct": 17.95,
+      "correct": 14,
+      "total": 78,
+      "elapsed_sec": 0.0
+    },
+    "tool_improvement_pp": 16.63
+  },
+  "by_category": {
+    "Armed conflicts and attacks": { "n": 24, "dyflow_pct": 0.0,  "dyflow_t_pct": 29.17 },
+    "Business and economy":        { "n": 3,  "dyflow_pct": 0.0,  "dyflow_t_pct": 0.0   },
+    "Disasters and accidents":     { "n": 4,  "dyflow_pct": 0.0,  "dyflow_t_pct": 0.0   },
+    "Disasters and incidents":     { "n": 3,  "dyflow_pct": 0.0,  "dyflow_t_pct": 0.0   },
+    "International relations":     { "n": 25, "dyflow_pct": 4.0,  "dyflow_t_pct": 18.52 },
+    "Law and crime":               { "n": 7,  "dyflow_pct": 0.0,  "dyflow_t_pct": 14.29 },
+    "Politics and elections":      { "n": 9,  "dyflow_pct": 0.0,  "dyflow_t_pct": 11.11 },
+    "Sports":                      { "n": 1,  "dyflow_pct": 0.0,  "dyflow_t_pct": 0.0   }
+  },
+  "overlap": {
+    "both_correct": 0,
+    "dyflow_t_only": 14,
+    "dyflow_only": 1,
+    "both_wrong": 62
+  },
+  "match_type_breakdown": {
+    "exact":     { "dyflow": 0,  "dyflow_pct": 0.0,  "dyflow_t": 5,  "dyflow_t_pct": 6.4  },
+    "contains":  { "dyflow": 1,  "dyflow_pct": 1.3,  "dyflow_t": 6,  "dyflow_t_pct": 7.7  },
+    "llm_judge": { "dyflow": 0,  "dyflow_pct": 0.0,  "dyflow_t": 3,  "dyflow_t_pct": 3.8  },
+    "refusal":   { "dyflow": 58, "dyflow_pct": 76.3, "dyflow_t": 22, "dyflow_t_pct": 28.2 },
+    "f1_0.00":   { "dyflow": 15, "dyflow_pct": 19.7, "dyflow_t": 31, "dyflow_t_pct": 39.7 },
+    "f1_0.04":   { "dyflow": 0,  "dyflow_pct": 0.0,  "dyflow_t": 1,  "dyflow_t_pct": 1.3  },
+    "f1_0.05":   { "dyflow": 0,  "dyflow_pct": 0.0,  "dyflow_t": 1,  "dyflow_t_pct": 1.3  },
+    "f1_0.06":   { "dyflow": 1,  "dyflow_pct": 1.3,  "dyflow_t": 1,  "dyflow_t_pct": 1.3  },
+    "f1_0.08":   { "dyflow": 1,  "dyflow_pct": 1.3,  "dyflow_t": 0,  "dyflow_t_pct": 0.0  },
+    "f1_0.21":   { "dyflow": 0,  "dyflow_pct": 0.0,  "dyflow_t": 1,  "dyflow_t_pct": 1.3  },
+    "f1_0.24":   { "dyflow": 0,  "dyflow_pct": 0.0,  "dyflow_t": 1,  "dyflow_t_pct": 1.3  },
+    "f1_0.33":   { "dyflow": 0,  "dyflow_pct": 0.0,  "dyflow_t": 1,  "dyflow_t_pct": 1.3  },
+    "f1_0.40":   { "dyflow": 0,  "dyflow_pct": 0.0,  "dyflow_t": 3,  "dyflow_t_pct": 3.8  },
+    "f1_0.50":   { "dyflow": 0,  "dyflow_pct": 0.0,  "dyflow_t": 1,  "dyflow_t_pct": 1.3  },
+    "f1_0.67":   { "dyflow": 0,  "dyflow_pct": 0.0,  "dyflow_t": 1,  "dyflow_t_pct": 1.3  },
+    "TOTAL":     { "dyflow": 76, "dyflow_pct": 100.0, "dyflow_t": 78, "dyflow_t_pct": 100.0 }
+  }
+}
