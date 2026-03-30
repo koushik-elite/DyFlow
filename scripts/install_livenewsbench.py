@@ -1,0 +1,297 @@
+#!/usr/bin/env python3
+"""
+install_livenewsbench.py — Download and prepare LiveNewsBench for DyFlow-T evaluation.
+
+LiveNewsBench is a benchmark for evaluating LLM web search capabilities using
+freshly curated news questions that require live retrieval to answer correctly.
+
+Paper:  https://arxiv.org/abs/2602.13543
+Source: https://huggingface.co/datasets/YunfanZhang42/LiveNewsBench
+
+Dataset fields:
+  date             — date of the news event (e.g. "2025-09-22")
+  category         — news category (Politics, Sports, Law/crime, etc.)
+  stripped_markdown— brief news context / headline summary
+  question         — the question (requires web search to answer)
+  answer           — gold answer
+
+Subsets:  sep_2025 (8.51k rows),  jan_2026 (1.33k rows)
+Splits:   train, val, test, human_verified_test
+
+Usage
+─────
+    # Sample only (no download — instant, for testing)
+    python scripts/install_livenewsbench.py --sample-only
+
+    # Full download (requires: pip install datasets)
+    python scripts/install_livenewsbench.py --subset sep_2025 --split val
+    python scripts/install_livenewsbench.py --subset jan_2026 --split human_verified_test
+    python scripts/install_livenewsbench.py --all    # download all subsets/splits
+"""
+
+import os
+import sys
+import json
+import hashlib
+import argparse
+
+REPO_ROOT   = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+DATA_DIR    = os.path.join(REPO_ROOT, "benchmarks", "data", "LiveNewsBench")
+HF_DATASET  = "YunfanZhang42/LiveNewsBench"
+
+# ── Sample questions (real questions from the dataset viewer) ──────────────────
+# These allow instant offline testing without downloading the full dataset.
+# Source: https://huggingface.co/datasets/YunfanZhang42/LiveNewsBench/viewer/
+
+SAMPLE_QUESTIONS = [
+    {
+        "id": "lnb_sep_001",
+        "date": "2025-09-22",
+        "category": "Politics and elections",
+        "stripped_markdown": "2025 Guinean constitutional referendum — Provisional results show that over 90% of voters in Guinea approve a constitutional change that permits members of the ruling junta to seek the presidency and extend term limits, amid opposition boycotts.",
+        "question": "Under Guinea's new post-coup constitution approved in the September 2025 referendum, presidential candidates must fall within a fixed age range. Given the reported age of junta leader Mamady Doumbouya when he voted in that referendum, by how many years was he below the constitution's upper age limit for presidential candidates?",
+        "answer": "40 years."
+    },
+    {
+        "id": "lnb_sep_002",
+        "date": "2025-09-07",
+        "category": "Sports",
+        "stripped_markdown": "2025 US Open — Carlos Alcaraz defeats defending champion Jannik Sinner in the men's singles final, 6–2, 3–6, 6–1, 6–4, to win his second US Open title and sixth major title overall.",
+        "question": "Carlos Alcaraz won his first US Open men's singles title in 2022 and his second in 2025. If you add the number of service games he lost during his 2022 title run to the total number of sets he played on his way to the 2025 title, what is the resulting total?",
+        "answer": "46."
+    },
+    {
+        "id": "lnb_sep_003",
+        "date": "2025-09-14",
+        "category": "Arts and culture",
+        "stripped_markdown": "77th Primetime Emmy Awards — The Studio wins Outstanding Comedy Series and The Pitt wins Outstanding Drama Series, while Adolescence wins Outstanding Limited or Anthology Series.",
+        "question": "At the 77th Primetime Emmy Awards, how many Emmys in total were won by the British Netflix miniseries filmed as a single continuous shot that follows 13-year-old Jamie Miller, accused of fatally stabbing his classmate Katie, and explores incel culture and teen smartphone use?",
+        "answer": "6"
+    },
+    {
+        "id": "lnb_sep_004",
+        "date": "2025-09-09",
+        "category": "Politics and elections",
+        "stripped_markdown": "2025 Indian vice presidential election — C.P. Radhakrishnan is elected as the 15th vice president of India.",
+        "question": "In coverage of the 2025 Indian vice-presidential election in which CP Radhakrishnan was chosen to replace Jagdeep Dhankhar, reports noted both how many seats in the Rajya Sabha were vacant in the vice-presidential electoral college at the time and how many times Radhakrishnan had previously been elected as a member of parliament from the Coimbatore Lok Sabha constituency. If you add those two counts together, what total do you get?",
+        "answer": "8"
+    },
+    {
+        "id": "lnb_sep_005",
+        "date": "2025-09-03",
+        "category": "Disasters and accidents",
+        "stripped_markdown": "Ascensor da Glória derailment — Sixteen people are killed and 22 others are injured when the Ascensor da Glória funicular crashes into a building in Lisbon, Portugal.",
+        "question": "In media coverage following the September 2025 crash of Lisbon's Elevador da Glória funicular, which transport workers' union's leader said that staff had previously raised concerns that cable-tension problems were making braking difficult, and which other transport workers' union later announced that brake guard André Jorge Gonçalves Marques was among those killed?",
+        "answer": "Fectrans and Sitra."
+    },
+    {
+        "id": "lnb_sep_006",
+        "date": "2025-09-13",
+        "category": "Sports",
+        "stripped_markdown": "Canelo Álvarez vs. Terence Crawford — Terence Crawford defeats Canelo Álvarez by unanimous decision, becoming the undisputed super middleweight champion and the second ever three-weight undisputed boxing champion.",
+        "question": "During Terence Crawford's undisputed super middleweight victory over Canelo Álvarez at Allegiant Stadium, some reports on the 'star-studded' crowd named five boxing Hall of Famers sitting among celebrities. Later coverage noted that Crawford's win made him the sixth fighter in history to hold world titles in five different weight divisions. Which one of the Hall of Fame spectators mentioned in that crowd description was also one of those five earlier five-division world champions?",
+        "answer": "Thomas Hearns"
+    },
+    {
+        "id": "lnb_sep_007",
+        "date": "2025-09-28",
+        "category": "Sports",
+        "stripped_markdown": "2025 Asia Cup — India defeat Pakistan by five wickets in the final to win their second consecutive Asia Cup title and ninth overall.",
+        "question": "During the 2025 Asia Cup in the UAE, a Pakistani opener first celebrated a half-century against India by cradling his bat like a machine gun, then in the India–Pakistan final reached 50 again but this time celebrated silently. What was his final run total in that final?",
+        "answer": "57 runs."
+    },
+    {
+        "id": "lnb_sep_008",
+        "date": "2025-09-27",
+        "category": "Law and crime",
+        "stripped_markdown": "Mass shootings in the United States — 2025 Southport shooting — At least three people are killed and eight others are injured in a mass shooting when a gunman on a boat opens fire at a restaurant at the Southport Yacht Basin in Southport, North Carolina.",
+        "question": "In the boat attack on the American Fish Company bar at the Southport Yacht Basin in North Carolina that left three patrons dead, if you list the home states of all three people who were killed and then remove the state in which the suspect was residing at the time of the attack, which states remain?",
+        "answer": "Virginia and Ohio"
+    },
+    {
+        "id": "lnb_sep_009",
+        "date": "2025-09-14",
+        "category": "Health and environment",
+        "stripped_markdown": "2025 Kasaï Province Ebola outbreak — The World Health Organization begins Ebola vaccinations for exposed individuals and health workers in Kasaï Province, Democratic Republic of the Congo.",
+        "question": "During the Ebola outbreak in Kasai Province in the DRC declared in early September as the country's first Ebola outbreak in three years, by how many did the reported death toll increase between the Congolese health ministry figures cited in reports on September 14 and the WHO director-general's update on September 18?",
+        "answer": "15."
+    },
+    {
+        "id": "lnb_sep_010",
+        "date": "2025-09-12",
+        "category": "Armed conflicts and attacks",
+        "stripped_markdown": "2025 Nepalese Gen Z protests — Nepali police announce that nine prisoners have been killed and 12,500 others are at large after a series of jailbreaks across Nepal amid the ongoing protests.",
+        "question": "In coverage of the September 2025 Gen Z-led protests in Nepal and the ensuing creation of an interim government, which Kathmandu mayor was cited by a 24-year-old protester as an example of an independent political figure who would make a good leader, and what stance did this mayor ultimately take toward Sushila Karki's appointment as interim prime minister?",
+        "answer": "Kathmandu mayor Balendra Shah, who ultimately endorsed Sushila Karki as interim prime minister."
+    },
+    {
+        "id": "lnb_sep_011",
+        "date": "2025-09-16",
+        "category": "Health and environment",
+        "stripped_markdown": "Climate of Spain — The Spanish State Meteorological Agency announces that 2025 was Spain's hottest summer since records began in 1961, averaging a temperature of 24.2 °C, surpassing 2022's record of 24.1 °C.",
+        "question": "During Spain's record-breaking summer of 2025, meteorological data from the state weather agency indicated that the country went through three heatwaves lasting a certain total number of days, while a slightly smaller number of days that season were classified as officially declared heatwaves. By how many days did the total duration of those heatwaves exceed the number of officially declared heatwave days?",
+        "answer": "3 days"
+    },
+    {
+        "id": "lnb_sep_012",
+        "date": "2025-09-07",
+        "category": "Law and crime",
+        "stripped_markdown": "Leongatha mushroom murders — Erin Patterson is sentenced to life in prison plus an extra 25 years without parole for 33 years for the 2023 poisoning of four relatives with Beef Wellingtons laced with poisonous death cap mushrooms.",
+        "question": "In the criminal case against Australian woman Erin Patterson over the fatal mushroom lunch, if you add together the total number of victim impact statements the court received and the number of days she had already spent in pre-sentence detention at the time of her sentencing, what total do you get?",
+        "answer": "704."
+    },
+    {
+        "id": "lnb_sep_013",
+        "date": "2025-09-05",
+        "category": "Politics and elections",
+        "stripped_markdown": "2025 British cabinet reshuffle — Prime Minister Keir Starmer conducts a cabinet reshuffle and appoints foreign secretary David Lammy as the new deputy PM and Shabana Mahmood as the new home secretary.",
+        "question": "During Keir Starmer's major cabinet reshuffle in early September 2025 following Angela Rayner's resignation, which minister's promotion was characterised as signalling that the government was making illegal immigration and asylum one of its biggest priorities, and who had previously described Margaret Thatcher as one of her political heroines and aligned herself with Labour's 'Blue Labour' tradition?",
+        "answer": "Shabana Mahmood."
+    },
+    {
+        "id": "lnb_sep_014",
+        "date": "2025-09-29",
+        "category": "Business and economy",
+        "stripped_markdown": "German airline Lufthansa announces they will cut 4,000 administrative positions by 2030 and replace them with artificial intelligence and digitization processes.",
+        "question": "Using Lufthansa Group's reported 2024 revenue and the minimum annual adjusted free cash flow it targeted from 2028 at its first company-wide capital markets day in six years, approximately how many years of that minimum free cash flow would be required to equal one year's 2024 revenue?",
+        "answer": "About 15 years."
+    },
+    {
+        "id": "lnb_sep_015",
+        "date": "2025-09-22",
+        "category": "Politics and elections",
+        "stripped_markdown": "2025 Moldovan parliamentary election — Moldovan police conduct 250 raids and detain 74 people as part of an investigation into an alleged Russia-supported plan to provoke unrest before the parliamentary election.",
+        "question": "During reporting on alleged Russian-backed efforts to destabilize Moldova ahead of its late-September 2025 parliamentary elections, one account described a fugitive Moldovan businessman offering citizens monthly payments to join anti-government protests, and another detailed the 'Matryoshka' pro-Russian disinformation campaign's false claim that President Maia Sandu had embezzled a specific sum. What is the businessman's name, and how much money did that campaign falsely allege Sandu had embezzled?",
+        "answer": "Ilan Shor and $24 million."
+    },
+    {
+        "id": "lnb_sep_016",
+        "date": "2025-09-21",
+        "category": "Sports",
+        "stripped_markdown": "Las Vegas Aces player A'ja Wilson wins a historic fourth WNBA MVP award and the first ever consecutive win in the league's history.",
+        "question": "During the Las Vegas Aces' 16-game winning streak that began after Napheesa Collier was sidelined by injury in the 2025 WNBA season, by how many points per game did A'ja Wilson's scoring average differ from her overall 2025 regular-season scoring average?",
+        "answer": "2.7 points per game."
+    },
+    {
+        "id": "lnb_sep_017",
+        "date": "2025-09-30",
+        "category": "Armed conflicts and attacks",
+        "stripped_markdown": "Russo-Ukrainian war — An overnight Russian drone strike kills four people, all members of the same family, in Chernechchyna, Okhtyrka Raion, Sumy Oblast, Ukraine.",
+        "question": "In the news coverage of the Russian drone attack that destroyed homes in the Sumy region village of Chernechchyna and killed an entire family there, Ukraine's air force and Russia's military each released figures for how many of the other side's drones they had downed that night. According to those statements, by how many drones did Russia's claimed destruction of Ukrainian drones exceed Ukraine's reported shootdowns of Russian drones?",
+        "answer": "35"
+    },
+    {
+        "id": "lnb_sep_018",
+        "date": "2025-09-24",
+        "category": "International relations",
+        "stripped_markdown": "Africa–United States relations — Lesotho's commerce minister announces the United States's plan to extend the African Growth and Opportunity Act by one year.",
+        "question": "In late-September 2024 discussions about the possible expiration of AGOA under new U.S. tariffs on African countries, research by the International Trade Centre projected a percentage decline in South Africa's shipments to the United States if AGOA ended, while U.S. trade data for 2024 reported a year-on-year percentage increase in total U.S.–Lesotho goods and services trade. By how many percentage points did the projected South African shipment decline exceed the reported Lesotho trade growth rate?",
+        "answer": "12.4 percentage points."
+    },
+    {
+        "id": "lnb_sep_019",
+        "date": "2025-09-11",
+        "category": "Health and environment",
+        "stripped_markdown": "Renewable energy in Brazil — Clean energy think tank Ember reports that wind and solar power generated over one-third of Brazil's electricity for the first time in August.",
+        "question": "During the August in which Brazil for the first time generated more than one-third of its electricity from wind and solar power, by how many percentage points did hydropower's share of the country's electricity generation exceed the share from fossil fuel plants?",
+        "answer": "34 percentage points."
+    },
+    {
+        "id": "lnb_sep_020",
+        "date": "2025-09-09",
+        "category": "Armed conflicts and attacks",
+        "stripped_markdown": "Middle Eastern crisis — Israeli airstrike on Hamas leadership in Qatar — The Israeli Air Force carries out a series of airstrikes against the Hamas leadership's office in Doha, Qatar, during a meeting.",
+        "question": "In reporting on Israel's September 2025 airstrike targeting Hamas leaders in Doha, what codename did Israeli officials say they had assigned to the building that was struck, and which U.S. officer, serving as chairman of the Joint Chiefs of Staff, informed President Donald Trump about the operation?",
+        "answer": "'Judgment Day' and Gen. Dan Caine."
+    },
+]
+
+
+def save_sample():
+    """Write the built-in sample questions to disk."""
+    out_dir = os.path.join(DATA_DIR, "sample")
+    os.makedirs(out_dir, exist_ok=True)
+    out_path = os.path.join(out_dir, "livenewsbench_sample.json")
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(SAMPLE_QUESTIONS, f, indent=2, ensure_ascii=False)
+    print(f"[LiveNewsBench] Sample saved: {out_path}  ({len(SAMPLE_QUESTIONS)} questions)")
+    return out_path
+
+
+def download_split(subset, split, force=False):
+    """Download a split from HuggingFace and save as JSON."""
+    out_dir = os.path.join(DATA_DIR, subset)
+    os.makedirs(out_dir, exist_ok=True)
+    out_path = os.path.join(out_dir, f"livenewsbench_{subset}_{split}.json")
+
+    if os.path.exists(out_path) and not force:
+        print(f"[LiveNewsBench] Already exists: {out_path}  (use --force to re-download)")
+        return out_path
+
+    try:
+        from datasets import load_dataset
+    except ImportError:
+        print("[ERROR] HuggingFace datasets library not installed.")
+        print("        Run: pip install datasets")
+        sys.exit(1)
+
+    print(f"[LiveNewsBench] Downloading {subset}/{split} from HuggingFace...")
+    ds = load_dataset(HF_DATASET, subset, split=split, trust_remote_code=True)
+    print(f"[LiveNewsBench] Downloaded {len(ds)} rows.")
+
+    rows = []
+    for i, item in enumerate(ds):
+        q = item.get("question", "")
+        a = item.get("answer", "")
+        rows.append({
+            "id":               f"lnb_{subset}_{split}_{i:05d}",
+            "date":             str(item.get("date", "")),
+            "category":         item.get("category", ""),
+            "stripped_markdown":item.get("stripped_markdown", ""),
+            "question":         q,
+            "answer":           a,
+        })
+
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(rows, f, indent=2, ensure_ascii=False)
+    print(f"[LiveNewsBench] Saved: {out_path}  ({len(rows)} rows)")
+    return out_path
+
+
+def main():
+    p = argparse.ArgumentParser(
+        description="Install LiveNewsBench dataset for DyFlow-T evaluation"
+    )
+    p.add_argument("--sample-only", action="store_true",
+                   help="Write built-in 20-question sample — no download needed")
+    p.add_argument("--subset", default="sep_2025",
+                   choices=["sep_2025", "jan_2026"],
+                   help="Dataset subset (default: sep_2025)")
+    p.add_argument("--split", default="val",
+                   choices=["train", "val", "test", "human_verified_test"],
+                   help="Dataset split (default: val)")
+    p.add_argument("--all", action="store_true",
+                   help="Download all subsets and splits")
+    p.add_argument("--force", action="store_true",
+                   help="Re-download even if file exists")
+    args = p.parse_args()
+
+    if args.sample_only:
+        save_sample()
+        print("\nTo run comparison with the sample:")
+        print("  python scripts/compare_livenewsbench.py --sample")
+        return
+
+    if args.all:
+        for subset in ["sep_2025", "jan_2026"]:
+            for split in ["val", "test", "human_verified_test"]:
+                download_split(subset, split, args.force)
+    else:
+        download_split(args.subset, args.split, args.force)
+
+    print("\nTo run comparison:")
+    print(f"  python scripts/compare_livenewsbench.py --subset {args.subset} --split {args.split}")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,686 @@
+"""
+dyflow/core/tool_operator.py
+────────────────────────────
+Extends DyFlow's operator system with two new classes:
+
+  ToolExecutorOperator  — routes an operator to a real tool (WebSearch / SQL)
+                          instead of an LLM, stores ToolResult in state memory.
+
+  ToolAwareLLMOperator  — LLM-executed operator that is "tool-aware":
+                          it has access to a prior ToolResult injected into its
+                          prompt context (used by TOOL_REVIEW, TOOL_REFINE,
+                          RESULT_EXTRACT, SEARCH_QUERY_FORMULATE).
+
+Both classes extend the original InstructExecutorOperator interface so the
+WorkflowExecutor can dispatch them without modification to its core loop.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import re
+from typing import Any, Dict, List, Optional
+
+from .operator import Operator, ExecuteSignal
+from .state import State
+from ..tools.base import ToolResult, ToolStatus
+from ..tools.registry import ToolRegistry
+
+logger = logging.getLogger(__name__)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PROMPT TEMPLATES  —  New tool operators (Appendix G extension)
+# ══════════════════════════════════════════════════════════════════════════════
+
+TOOL_PROMPT_TEMPLATES: Dict[str, str] = {
+
+    # ── SEARCH_QUERY_FORMULATE ────────────────────────────────────────────────
+    "SEARCH_QUERY_FORMULATE": """You are an expert at constructing precise and effective web search queries.
+Given the current task context and subgoal, formulate the optimal search query
+that will retrieve the most relevant and useful information.
+
+Context:
+{context}
+
+Guidance:
+{guidance}
+
+Instructions:
+- Identify the core information need from the current subgoal.
+- Use specific, unambiguous keywords — avoid generic terms.
+- Include domain qualifiers if the topic is specialised.
+- If the information need has multiple facets, generate up to 3 ranked query variants.
+- Select the single best query as the primary output.
+- Keep the primary query under 10 tokens.
+
+Output Format:
+Primary Query: <best single query string>
+Alternative Queries:
+  1. <variant 1>
+  2. <variant 2>
+Rationale: <one sentence explaining why this query best targets the subgoal>""",
+
+    # ── SQL_GENERATE ──────────────────────────────────────────────────────────
+    # This is a pure LLM reasoning step — both DyFlow and DyFlow-T can do this.
+    # The DIFFERENTIATOR is SQL_QUERY which EXECUTES the SQL and returns real rows.
+    "SQL_GENERATE": """You are an expert SQLite SQL engineer. Generate a precise SQL SELECT query
+to answer the natural language question using the provided schema.
+
+IMPORTANT: This SQL will be EXECUTED against a real SQLite database.
+You must write syntactically correct SQL — errors mean no data is retrieved.
+
+Database Schema:
+{schema}
+
+Question:
+{question}
+
+Context:
+{context}
+
+Rules:
+- Write valid SQLite syntax only.
+- Use only tables and columns that exist in the schema above.
+- Prefer explicit column names over SELECT *.
+- Use JOINs when data spans multiple tables.
+- Use GROUP BY with aggregates (COUNT, SUM, AVG, MAX, MIN).
+- Use subqueries or CTEs for complex multi-step logic.
+- Do NOT include any explanation — output the SQL query only.
+- Do NOT wrap in markdown fences.
+
+Output Format:
+SQL: <single valid SQLite SELECT statement ending with semicolon>""",
+
+    # ── WEB_SEARCH ────────────────────────────────────────────────────────────
+    # Note: this template is used to FORMAT the result for memory storage
+    # (actual retrieval is done by WebSearchTool.execute, not the LLM)
+    "WEB_SEARCH": """You are an expert at synthesising web search results into actionable findings.
+Analyse the retrieved results and extract the most relevant information for the current subgoal.
+
+Context:
+{context}
+
+Guidance:
+{guidance}
+
+Retrieved Results:
+{tool_output}
+
+Instructions:
+- Identify the most relevant results for the current subgoal.
+- Extract key facts, figures, or statements directly from the retrieved snippets.
+- Do NOT hallucinate or infer beyond what the results explicitly state.
+- If results are insufficient or contradictory, flag this in the output.
+- Summarise findings in 3–5 concise bullet points.
+
+Output Format:
+Query Issued: <the exact query string submitted>
+Relevant Sources: <list of titles and URLs used>
+Key Findings:
+  - <finding 1>
+  - <finding 2>
+Confidence: <high / medium / low>
+Gaps: <any missing information or ambiguity noted>""",
+
+    # ── SQL_QUERY ─────────────────────────────────────────────────────────────
+    # This template interprets REAL EXECUTED rows from the SQLite tool.
+    # The tool already ran the SQL — the LLM's job here is ONLY to interpret
+    # the actual returned rows, NOT to guess or assume what the result would be.
+    "SQL_QUERY": """You are interpreting the REAL results of a SQL query that was executed
+against a live SQLite database. These are actual database rows — not estimates.
+
+Context:
+{context}
+
+Guidance:
+{guidance}
+
+Database Schema:
+{schema}
+
+SQL Query Executed:
+{sql_query}
+
+ACTUAL Execution Result (real rows from database):
+{tool_output}
+
+Instructions:
+- Interpret ONLY what the actual returned rows say — do not assume or hallucinate.
+- If the result is a single number (COUNT, SUM, AVG), state it directly.
+- If the result is a list of rows, summarise what they contain.
+- If 0 rows returned, state clearly: "The query returned no results."
+- If there was an error, describe it — do NOT invent a result.
+- The answer must come directly from the rows above, nothing else.
+
+Output Format:
+SQL Executed: <the sql that ran>
+Row Count: <exact number of rows returned>
+Execution Status: <success / empty / error>
+Result Interpretation: <plain English interpretation of the actual rows>
+Final Answer: <the direct answer to the question based solely on the real rows above>""",
+
+    # ── TOOL_REVIEW ───────────────────────────────────────────────────────────
+    "TOOL_REVIEW": """You are a pragmatic reviewer of tool outputs. Your role is to
+check whether the result is usable for the current subgoal — not to judge perfection.
+
+Context:
+{context}
+
+Guidance:
+{guidance}
+
+Tool Operator Executed: {tool_operator_name}
+Tool Input (Query/Parameters): {tool_input}
+Tool Output:
+{tool_output}
+
+Review Rules (apply based on tool type):
+
+For WEB_SEARCH results:
+  - accept  → output contains ANY real, on-topic information
+  - retry_with_refinement → query was completely off-topic or returned only ads/spam
+  - reject  → output is empty, all mock/placeholder data, or a tool error
+
+For SQL_QUERY results:
+  - accept  → query executed without error and returned rows (even if partial)
+  - accept  → query returned 0 rows and that IS a valid answer (e.g. "no results found")
+  - retry_with_refinement → SQL syntax error, wrong table/column name, or clearly wrong logic
+  - reject  → database connection error or tool completely failed to execute
+
+General rule: partial or incomplete results → accept (RESULT_EXTRACT handles refinement).
+Never reject just because the result is not 100% complete.
+
+The Recommended Action MUST match the verdict:
+  accept               → Recommended Action: proceed
+  retry_with_refinement → Recommended Action: invoke TOOL_REFINE
+  reject               → Recommended Action: escalate to designer
+
+Output Format:
+Relevance Check: <yes / partial / no>
+Accuracy Assessment: <are the facts real and on-topic? did SQL execute correctly?>
+Completeness: <sufficient / partial / insufficient>
+Identified Issues:
+  - <issue or "none">
+Overall Verdict: <accept / retry_with_refinement / reject>
+Recommended Action: <proceed / invoke TOOL_REFINE / escalate to designer>""",
+
+    # ── TOOL_REFINE ───────────────────────────────────────────────────────────
+    "TOOL_REFINE": """You are an expert at diagnosing and correcting failed or low-quality tool calls.
+Analyse the failure and produce a corrected reformulation of the tool invocation.
+
+Context:
+{context}
+
+Guidance:
+{guidance}
+
+Original Tool Operator: {tool_operator_name}
+Original Input (Query/Parameters): {original_tool_input}
+Original Tool Output:
+{original_tool_output}
+
+Review Verdict: {tool_review_verdict}
+Identified Issues: {tool_review_issues}
+
+Instructions:
+- Diagnose the root cause of the failure or insufficiency from the review verdict.
+- Reformulate the query or parameters to address the identified issue specifically.
+- For WEB_SEARCH: use alternative keywords, add domain qualifiers, or narrow scope.
+- For SQL_QUERY: correct syntax errors, fix JOIN conditions, or adjust column refs.
+- Provide the corrected query as output; the executor will re-run the tool.
+- Limit refinement to 2 iterations; if still failing, escalate to designer.
+
+Output Format:
+Failure Diagnosis: <root cause identified from the review verdict>
+Refinement Strategy: <what was changed and why>
+Refined Query: <the corrected query string or SQL>
+Resolution Status: <resolved / partially_resolved / unresolved>
+Next Action: <proceed / escalate to designer>""",
+
+    # ── RESULT_EXTRACT ────────────────────────────────────────────────────────
+    "RESULT_EXTRACT": """You are extracting the final answer from tool execution results.
+
+Context:
+{context}
+
+Guidance:
+{guidance}
+
+Source Tool: {tool_operator_name}
+Raw Tool Output:
+{tool_output}
+
+Target Subgoal: {subgoal_description}
+
+Instructions (apply based on source tool):
+
+If source tool is SQL_QUERY (database execution):
+  - The rows above are REAL data from the database — treat them as ground truth.
+  - Extract the answer directly from the Row Count and Result Interpretation fields.
+  - Do NOT reason about what the answer "should" be — read it from the actual rows.
+  - A COUNT of 2 means the answer is 2. A SUM of 450.5 means the answer is 450.5.
+
+If source tool is WEB_SEARCH (web retrieval):
+  - Extract only facts explicitly stated in the retrieved snippets.
+  - Do NOT hallucinate or infer beyond what the results explicitly state.
+  - Note the source URL for each extracted fact.
+
+General rules:
+  - If no relevant information can be extracted, state this explicitly.
+  - The Final Answer MUST be a direct, concise answer (a number, name, list, or short phrase).
+  - Do NOT pad with explanation — the answer should be copy-pasteable as-is.
+
+Output Format:
+Extracted Facts:
+  <key>: <value>  [source: <table or URL>]
+Summary: <1-2 sentence synthesis>
+Extraction Confidence: <high / medium / low>
+Final Answer: <the direct answer — number, name, or short phrase>""",
+}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TOOL VERDICT PARSER
+# ══════════════════════════════════════════════════════════════════════════════
+
+def parse_tool_review_verdict(review_text: str) -> str:
+    """
+    Extracts the 'Overall Verdict' from a TOOL_REVIEW output string.
+
+    Returns one of: 'accept', 'retry_with_refinement', 'reject'.
+    Defaults to 'accept' if no clear verdict is found, so the
+    workflow always moves forward rather than stalling on ambiguity.
+    """
+    if not review_text:
+        return "accept"
+
+    # 1. Try to find explicit 'Overall Verdict: <value>' line
+    pattern = r"Overall Verdict\s*[:\-]\s*\*{0,2}(accept|retry_with_refinement|reject)\*{0,2}"
+    match = re.search(pattern, review_text, re.IGNORECASE)
+    if match:
+        return match.group(1).lower()
+
+    # 2. Scan anywhere in text for the verdict keywords
+    text_lower = review_text.lower()
+
+    # Check reject first (most specific — prevents false accept on "not reject")
+    if re.search(r"\breject\b", text_lower):
+        # Only treat as reject if there's no 'accept' that overrides it
+        if not re.search(r"\baccept\b", text_lower):
+            return "reject"
+
+    if re.search(r"\bretry_with_refinement\b|\bretry with refinement\b", text_lower):
+        return "retry_with_refinement"
+
+    if re.search(r"\baccept\b", text_lower):
+        return "accept"
+
+    # 3. Default to accept — partial results should flow forward
+    return "accept"
+
+
+def parse_refined_query(refine_text: str) -> Optional[str]:
+    """
+    Extracts the 'Refined Query' from a TOOL_REFINE output string.
+    Returns None if not found.
+    """
+    pattern = r"Refined Query\s*:\s*(.+?)(?:\n|$)"
+    match = re.search(pattern, refine_text, re.IGNORECASE | re.DOTALL)
+    if match:
+        return match.group(1).strip()
+    return None
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TOOL EXECUTOR OPERATOR
+# ══════════════════════════════════════════════════════════════════════════════
+
+class ToolExecutorOperator(Operator):
+    """
+    Dispatches an operator to a real external tool (WebSearch or SQLQuery)
+    instead of an LLM.
+
+    The operator reads its input parameters from state memory (M) using
+    the ψ (input_keys) convention, calls the registered tool, and writes
+    a ToolResult-derived string back to M under the output_key.
+
+    Behaviour mirrors InstructExecutorOperator's memory read/write pattern
+    so the WorkflowExecutor loop requires no structural changes.
+    """
+
+    def __init__(
+        self,
+        operator_id:          str,
+        operator_description: str,
+        tool_registry:        ToolRegistry,
+    ) -> None:
+        super().__init__(operator_id, operator_description)
+        self.tool_registry = tool_registry
+
+    def execute(self, state: State, params: Dict[str, Any]) -> ExecuteSignal:
+        instruction_type = params.get("instruction_type", "").upper()
+        output_key       = params.get("output_key", self.operator_id)
+        input_keys       = params.get("input_keys", [])
+        input_usage      = params.get("input_usage", "")
+
+        # ── Resolve inputs from memory ────────────────────────────────────────
+        resolved_inputs: Dict[str, str] = {}
+        for key in input_keys:
+            path = f"actions.{key}.content" if not key.startswith("actions.") and "." not in key else key
+            val  = state.get_data_by_path(path) or state.get_data_by_path(key) or ""
+            resolved_inputs[key] = str(val)
+
+        # ── Get tool ──────────────────────────────────────────────────────────
+        tool = self.tool_registry.get(instruction_type)
+        if tool is None:
+            err = f"No tool registered for instruction_type='{instruction_type}'"
+            logger.error(err)
+            self._store_output(state, output_key, f"ERROR: {err}")
+            self._log_execution(state, params, "error", error_message=err)
+            return "next"
+
+        # ── Build tool params from resolved memory inputs ──────────────────
+        # Convention: the 'guidance' field of the operator contains the query
+        # or, if a SEARCH_QUERY_FORMULATE result is available, use that.
+        tool_params = self._build_tool_params(
+            instruction_type, resolved_inputs, params, state
+        )
+
+        # ── Execute tool ──────────────────────────────────────────────────────
+        logger.info(f"[ToolExecutorOperator] {instruction_type} | params={tool_params}")
+        print(f"\n--- Tool Operator: {instruction_type} ---")
+        print(f"  Params: {tool_params}")
+
+        result: ToolResult = tool._timed_execute(tool_params)
+
+        print(f"  Status: {result.status.value} | elapsed: {result.elapsed_sec:.2f}s")
+
+        # ── Store raw ToolResult in memory ────────────────────────────────────
+        output_str = result.to_prompt_string()
+        self._store_output(state, output_key, output_str)
+
+        # Also store structured data separately for downstream operators
+        structured_key = f"{output_key}_structured"
+        if result.structured:
+            self._store_output(
+                state, structured_key, json.dumps(result.structured, default=str)
+            )
+
+        # Attach tool metadata to state for TOOL_REVIEW injection
+        if not hasattr(state, "tool_results"):
+            state.tool_results = {}
+        state.tool_results[output_key] = result
+
+        self._log_execution(
+            state, params, "next",
+            tool_status=result.status.value,
+            tool_elapsed=result.elapsed_sec,
+        )
+        print(f"--- Tool Operator {self.operator_id} Finished ---")
+        return "next"
+
+    # ── Helpers ───────────────────────────────────────────────────────────────
+
+    def _build_tool_params(
+        self,
+        instruction_type: str,
+        resolved_inputs:  Dict[str, str],
+        params:           Dict[str, Any],
+        state:            State,
+    ) -> Dict[str, Any]:
+        """
+        Build the concrete dict to pass to tool.execute().
+
+        Priority for query:
+          1. Explicit 'query' key in input_keys
+          2. Refined query from TOOL_REFINE output in memory
+          3. Formulated query from SEARCH_QUERY_FORMULATE in memory
+          4. Operator guidance field (free-text instruction from designer)
+        """
+        guidance = params.get("guidance", params.get("input_usage", ""))
+
+        if instruction_type == "WEB_SEARCH":
+            # Prefer a formulated query from memory
+            query = (
+                resolved_inputs.get("query")
+                or self._find_formulated_query(state)
+                or guidance.strip()
+            )
+            return {"query": query, "top_k": params.get("top_k", 5)}
+
+        elif instruction_type == "SQL_QUERY":
+            query = (
+                resolved_inputs.get("sql_query")
+                or resolved_inputs.get("query")
+                or self._find_generated_sql(state)
+                or self._find_refined_query(state)
+                or guidance.strip()
+            )
+            # Strip any residual markdown fences or "SQL:" prefix
+            query = re.sub(r"```(?:sql)?\s*", "", query).replace("```", "").strip()
+            query = re.sub(r"^SQL\s*:\s*", "", query, flags=re.IGNORECASE).strip()
+            return {
+                "query": query,
+                "limit": params.get("limit", 50),
+            }
+
+        return {"query": guidance.strip()}
+
+    def _find_formulated_query(self, state: State) -> Optional[str]:
+        """Scan state memory for the output of a SEARCH_QUERY_FORMULATE operator."""
+        for key, val in state.actions.items():
+            if "formulated_query" in key or "search_query" in key:
+                content = val.get("content", "")
+                match   = re.search(r"Primary Query\s*:\s*(.+?)(?:\n|$)", content, re.IGNORECASE)
+                if match:
+                    return match.group(1).strip().strip("`")
+        return None
+
+    def _find_generated_sql(self, state: State) -> Optional[str]:
+        """Scan state memory for SQL_GENERATE output and extract the SQL statement."""
+        for key, val in state.actions.items():
+            if any(tok in key.lower() for tok in ("sql_generate", "generated_sql", "sql_query_gen")):
+                content = val.get("content", "")
+                # Parse "SQL: <statement>" format
+                match = re.search(r"SQL\s*:\s*(SELECT.+?)(?:;?\s*$)", content,
+                                  re.IGNORECASE | re.DOTALL)
+                if match:
+                    return match.group(1).strip().rstrip(";") + ";"
+                # Fallback: grab any SELECT statement
+                match = re.search(r"(SELECT\s+.+?)(?:;|$)", content,
+                                  re.IGNORECASE | re.DOTALL)
+                if match:
+                    return match.group(1).strip()
+        return None
+
+    def _find_refined_query(self, state: State) -> Optional[str]:
+        """Scan state memory for a TOOL_REFINE refined query."""
+        for key, val in state.actions.items():
+            if "refined" in key:
+                content = val.get("content", "")
+                parsed  = parse_refined_query(content)
+                if parsed:
+                    return parsed
+        return None
+
+    def _store_output(self, state: State, output_key: str, content: str) -> None:
+        full_key = (
+            f"actions.{output_key}.content"
+            if not output_key.startswith("actions.") and "." not in output_key
+            else output_key
+        )
+        state.set_data_by_path(full_key, content)
+        action_id = output_key.split(".")[-3] if output_key.startswith("actions.") else output_key
+        if action_id not in state.actions:
+            state.actions[action_id] = {}
+        state.actions[action_id]["content"] = content
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TOOL-AWARE LLM OPERATOR
+# ══════════════════════════════════════════════════════════════════════════════
+
+class ToolAwareLLMOperator(Operator):
+    """
+    An LLM-executed operator that enriches its context with ToolResult data
+    from state memory before calling the LLM.
+
+    Used for: TOOL_REVIEW, TOOL_REFINE, RESULT_EXTRACT, SEARCH_QUERY_FORMULATE.
+
+    The operator automatically injects {tool_output}, {tool_operator_name},
+    and {tool_input} into the prompt if a preceding ToolResult is found in
+    state.tool_results.
+    """
+
+    def __init__(
+        self,
+        operator_id:          str,
+        operator_description: str,
+        llm_client,           # ExecutorLLMClient instance
+    ) -> None:
+        super().__init__(operator_id, operator_description)
+        self.llm_client = llm_client
+
+    def execute(self, state: State, params: Dict[str, Any]) -> ExecuteSignal:
+        instruction_type = params.get("instruction_type", "").upper()
+        output_key       = params.get("output_key", self.operator_id)
+        input_keys       = params.get("input_keys", [])
+
+        # ── Resolve standard inputs ───────────────────────────────────────────
+        resolved = {}
+        for key in input_keys:
+            path = f"actions.{key}.content" if "." not in key else key
+            resolved[key] = state.get_data_by_path(path) or state.get_data_by_path(key) or ""
+
+        # ── Build prompt context ──────────────────────────────────────────────
+        context  = self._build_context(state, resolved, input_keys)
+        guidance = params.get("input_usage", params.get("guidance", ""))
+
+        # ── Inject tool-specific fields ───────────────────────────────────────
+        tool_fields = self._extract_tool_fields(state, input_keys)
+
+        # ── Select and fill template ──────────────────────────────────────────
+        template = TOOL_PROMPT_TEMPLATES.get(instruction_type, TOOL_PROMPT_TEMPLATES.get("RESULT_EXTRACT", ""))
+        if not template:
+            logger.warning(f"No template for instruction_type='{instruction_type}'")
+            template = "Context:\n{context}\n\nGuidance:\n{guidance}\n\nOutput:\n"
+
+        prompt = self._safe_format(template, {
+            "context":             context,
+            "guidance":            guidance,
+            "tool_output":         tool_fields.get("tool_output", "(not available)"),
+            "tool_operator_name":  tool_fields.get("tool_operator_name", "unknown"),
+            "tool_input":          tool_fields.get("tool_input", "unknown"),
+            "original_tool_input": tool_fields.get("original_tool_input", "unknown"),
+            "original_tool_output":tool_fields.get("tool_output", "(not available)"),
+            "tool_review_verdict": tool_fields.get("tool_review_verdict", "unknown"),
+            "tool_review_issues":  tool_fields.get("tool_review_issues", "none"),
+            "subgoal_description": guidance,
+            "schema":              tool_fields.get("schema", "(not provided)"),
+            "sql_query":           tool_fields.get("sql_query", ""),
+            **resolved,
+        })
+
+        # ── Call LLM ──────────────────────────────────────────────────────────
+        print(f"\n--- Tool-Aware LLM Operator: {instruction_type} ---")
+        try:
+            llm_output = self.llm_client.chat(prompt)
+        except Exception as exc:
+            llm_output = f"ERROR calling LLM: {exc}"
+            logger.error(llm_output)
+
+        # ── Store output ──────────────────────────────────────────────────────
+        full_key = (
+            f"actions.{output_key}.content"
+            if "." not in output_key
+            else output_key
+        )
+        state.set_data_by_path(full_key, llm_output)
+        if output_key not in state.actions:
+            state.actions[output_key] = {}
+        state.actions[output_key]["content"] = llm_output
+
+        self._log_execution(state, params, "next", llm_output_preview=llm_output[:120])
+        print(f"--- Tool-Aware LLM Operator {self.operator_id} Finished ---")
+        return "next"
+
+    # ── Private helpers ───────────────────────────────────────────────────────
+
+    def _build_context(
+        self, state: State, resolved: Dict[str, str], input_keys: List[str]
+    ) -> str:
+        parts = [f"Problem: {state.original_problem}"]
+        for key in input_keys:
+            if key in resolved and resolved[key]:
+                parts.append(f"[{key}]:\n{resolved[key]}")
+        return "\n\n".join(parts)
+
+    def _extract_tool_fields(
+        self, state: State, input_keys: List[str]
+    ) -> Dict[str, str]:
+        """
+        Find the most recent ToolResult in state.tool_results that matches
+        one of the input_keys, and extract fields for prompt injection.
+        Also injects the SQL generated by SQL_GENERATE into {sql_query}.
+        """
+        fields: Dict[str, str] = {}
+        tool_results = getattr(state, "tool_results", {})
+
+        for key in input_keys:
+            base_key = key.replace("actions.", "").split(".")[0]
+            if base_key in tool_results:
+                tr: ToolResult = tool_results[base_key]
+                fields["tool_output"]        = tr.raw_output
+                fields["tool_operator_name"] = tr.tool_name
+                fields["tool_input"]         = tr.query
+                fields["original_tool_input"]= tr.query
+                # For SQL_QUERY: expose the actual query that was executed
+                fields["sql_query"]          = tr.query
+                break
+
+        # If no tool result matched, still try to surface the most recent one
+        if "tool_output" not in fields and tool_results:
+            tr = list(tool_results.values())[-1]
+            fields["tool_output"]        = tr.raw_output
+            fields["tool_operator_name"] = tr.tool_name
+            fields["tool_input"]         = tr.query
+            fields["sql_query"]          = tr.query
+
+        # Inject SQL from SQL_GENERATE output into {sql_query} placeholder
+        # so the SQL_QUERY interpretation template can show what query ran
+        if "sql_query" not in fields or not fields["sql_query"]:
+            for key, val in state.actions.items():
+                if any(tok in key.lower() for tok in ("sql_generate", "generated_sql")):
+                    content = val.get("content", "")
+                    match = re.search(r"SQL\s*:\s*(SELECT.+?)(?:;?\s*$)", content,
+                                      re.IGNORECASE | re.DOTALL)
+                    if match:
+                        fields["sql_query"] = match.group(1).strip()
+                        break
+
+        # Parse TOOL_REVIEW verdict from memory for TOOL_REFINE
+        for key, val in state.actions.items():
+            if "review" in key.lower():
+                content = val.get("content", "")
+                verdict = parse_tool_review_verdict(content)
+                if verdict != "unknown":
+                    fields["tool_review_verdict"] = verdict
+                    issues_match = re.search(
+                        r"Identified Issues\s*:(.*?)(?:Overall Verdict|$)",
+                        content, re.IGNORECASE | re.DOTALL
+                    )
+                    fields["tool_review_issues"] = (
+                        issues_match.group(1).strip() if issues_match else "none"
+                    )
+                break
+
+        return fields
+
+    @staticmethod
+    def _safe_format(template: str, kwargs: Dict[str, Any]) -> str:
+        """Format a template, replacing missing keys with a placeholder."""
+        for key, val in kwargs.items():
+            template = template.replace(f"{{{key}}}", str(val) if val is not None else "")
+        return template

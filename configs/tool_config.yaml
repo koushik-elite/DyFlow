@@ -1,0 +1,63 @@
+# configs/tool_config.yaml
+# ─────────────────────────────────────────────────────────────────────────────
+# Configuration for DyFlow-T (Tool-Augmented DyFlow)
+# Use this file to configure tool endpoints, LLM services, and benchmark settings.
+
+# ── Designer (DyPlanner / GPT-4.1) ───────────────────────────────────────────
+designer:
+  model:       "gpt-4.1"          # or "dyplanner" (fine-tuned Phi-4)
+  temperature: 0.0
+  max_tokens:  2048
+
+# ── Executor ──────────────────────────────────────────────────────────────────
+executor:
+  model:       "gpt-4.1-mini"    # lightweight executor model
+  temperature: 0.0
+  max_tokens:  1024
+
+# ── Tool Configuration ────────────────────────────────────────────────────────
+tools:
+  web_search:
+    enabled:    true
+    provider:   "tavily"           # or "mock" for offline testing
+    api_key_env: "TAVILY_API_KEY"  # env var name holding the key
+    top_k:      5                 # default results per query
+    timeout:    15                # seconds
+
+  sql_query:
+    enabled:    true
+    db_url_env: "SQL_DB_URL"      # env var: e.g. "sqlite:///data/spider.db"
+    max_rows:   50
+    read_only:  true              # safety: reject non-SELECT queries
+    timeout:    30
+
+# ── Workflow ──────────────────────────────────────────────────────────────────
+workflow:
+  max_steps:        4
+  max_tool_retries: 1             # max TOOL_REFINE iterations per failed tool call
+  save_design_history: true
+
+# ── Benchmarks ────────────────────────────────────────────────────────────────
+benchmarks:
+  # Web search evaluation
+  gaia:
+    data_path:   "data/gaia/test.jsonl"
+    split:       "test"
+    metric:      "exact_match"
+
+  # Text-to-SQL evaluation
+  spider:
+    db_root:     "data/spider/database"
+    data_path:   "data/spider/dev.json"
+    metric:      "execution_accuracy"
+
+  bird:
+    db_root:     "data/bird/dev_databases"
+    data_path:   "data/bird/dev.json"
+    metric:      "execution_accuracy"
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+logging:
+  level:       "INFO"
+  log_dir:     "logs/tool_experiments"
+  save_trajectories: true

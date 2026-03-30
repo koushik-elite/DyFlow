@@ -6,4 +6,7 @@ vllm
 numpy
 pandas
 requests
+google-search-results  # SerpAPI client (WebSearchTool)
+python-dotenv          # loads .env file into os.environ
 tqdm
+google-cloud-aiplatform

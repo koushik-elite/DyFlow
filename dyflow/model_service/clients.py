@@ -14,6 +14,14 @@ except ImportError:  # pragma: no cover - optional dependency
     AsyncOpenAI = None  # type: ignore
     OpenAI = None  # type: ignore
 
+try:
+    import vertexai  # type: ignore
+    from vertexai.generative_models import GenerativeModel, GenerationConfig  # type: ignore
+except ImportError:  # pragma: no cover - optional dependency
+    vertexai = None  # type: ignore
+    GenerativeModel = None  # type: ignore
+    GenerationConfig = None  # type: ignore
+
 from .config import ENV_VARS, MODEL_MAPPING
 from .utils import retry_decorator
 
@@ -32,6 +40,7 @@ class ModelClients:
         self._yi_client = None
         self._async_yi_client = None
         self._local_client = None
+        self._gemini_client = None
     
     def _init_openai(self):
         """Initialize OpenAI client"""
@@ -128,6 +137,33 @@ class ModelClients:
             base_url='http://localhost:8000/v1/'
         )
 
+    def _init_gemini(self):
+        """Initialize Gemini client via Vertex AI (no API key required).
+
+        Authenticates using Application Default Credentials (ADC).
+        Set credentials with: gcloud auth application-default login
+
+        Required env vars:
+            GOOGLE_CLOUD_PROJECT  — GCP project ID
+            GOOGLE_CLOUD_LOCATION — region (default: 'global')
+        """
+        if vertexai is None:
+            print(
+                "Warning: google-cloud-aiplatform package not installed. "
+                "Run: pip install google-cloud-aiplatform"
+            )
+            return None
+        project_id = os.getenv(ENV_VARS['gemini']['project'])
+        location   = os.getenv(ENV_VARS['gemini']['location'], 'global')
+        if not project_id:
+            print(
+                f"Warning: GCP project ID not found in environment variable "
+                f"{ENV_VARS['gemini']['project']}"
+            )
+            return None
+        vertexai.init(project=project_id, location=location)
+        return vertexai  # SDK is now initialised; GenerativeModel is instantiated per-call
+
     # Lazy loading properties
     @property
     def openai_client(self):
@@ -185,46 +221,57 @@ class ModelClients:
             self._local_client = self._init_local()
         return self._local_client
 
+    @property
+    def gemini_client(self):
+        """Lazy load Gemini client (initialises Vertex AI SDK with project + location)"""
+        if self._gemini_client is None:
+            self._gemini_client = self._init_gemini()
+        return self._gemini_client
+
     def get_client(self, model_type: str):
         """Get the appropriate client for the model type (with lazy loading)"""
-        # Use dictionary with property getters to ensure lazy loading
-        clients = {
-            'openai': self.openai_client,
-            'anthropic': self.anthropic_client,
-            'deepinfra': self.deepinfra_client,
-            'yi': self.yi_client,
-            'local': self.local_client
+        client_map = {
+            'openai':    lambda: self.openai_client,
+            'anthropic': lambda: self.anthropic_client,
+            'deepinfra': lambda: self.deepinfra_client,
+            'yi':        lambda: self.yi_client,
+            'local':     lambda: self.local_client,
+            'gemini':    lambda: self.gemini_client,
         }
-        
-        if model_type not in clients:
+
+        if model_type not in client_map:
             raise ValueError(f"Unknown model type: {model_type}")
-        
-        client = clients[model_type]
+
+        client = client_map[model_type]()
         if client is None:
             env_var = ENV_VARS.get(model_type, f"{model_type}_api_key")
-            raise ValueError(f"Client for {model_type} is not configured properly. Please check the {env_var} environment variable.")
-        
+            raise ValueError(
+                f"Client for {model_type} is not configured properly. "
+                f"Please check the {env_var} environment variable."
+            )
         return client
     
     def get_async_client(self, model_type: str):
         """Get the appropriate async client for the model type (with lazy loading)"""
-        # Use dictionary with property getters to ensure lazy loading
-        clients = {
-            'openai': self.async_openai_client,
-            'anthropic': self.anthropic_client,  # Note: Anthropic might not have async API
-            'deepinfra': self.async_deepinfra_client,
-            'yi': self.async_yi_client,
-            'local': self.local_client  # Local client doesn't support async
+        client_map = {
+            'openai':    lambda: self.async_openai_client,
+            'anthropic': lambda: self.anthropic_client,
+            'deepinfra': lambda: self.async_deepinfra_client,
+            'yi':        lambda: self.async_yi_client,
+            'local':     lambda: self.local_client,
+            'gemini':    lambda: self.gemini_client,
         }
-        
-        if model_type not in clients:
+
+        if model_type not in client_map:
             raise ValueError(f"Unknown model type: {model_type}")
-        
-        client = clients[model_type]
+
+        client = client_map[model_type]()
         if client is None:
             env_var = ENV_VARS.get(model_type, f"{model_type}_api_key")
-            raise ValueError(f"Async client for {model_type} is not configured properly. Please check the {env_var} environment variable.")
-        
+            raise ValueError(
+                f"Async client for {model_type} is not configured properly. "
+                f"Please check the {env_var} environment variable."
+            )
         return client
 
     @retry_decorator(max_retries=3, delay=1, backoff=2)
@@ -351,6 +398,90 @@ class ModelClients:
         )
         
         return response.choices[0].message.parsed
+
+    @retry_decorator(max_retries=3, delay=1, backoff=2)
+    def call_gemini(self, model: str, prompt: str, temperature: float = 0.001,
+                    max_tokens: int = 8192, msg: list = None) -> str:
+        """Call Google Gemini models via Vertex AI SDK.
+
+        Authentication uses Application Default Credentials (ADC) —
+        no API key required. Initialise with:
+            gcloud auth application-default login
+
+        Args:
+            model: User-friendly model name (e.g. 'gemini-2.5-flash').
+            prompt: The input prompt string.
+            temperature: Sampling temperature.
+            max_tokens: Maximum output tokens (default 8192 for Gemini).
+            msg: Optional pre-formatted contents list compatible with the
+                 Vertex AI GenerativeModel.generate_content() interface.
+                 If None, the prompt string is used directly.
+
+        Returns:
+            Tuple of (response_text, tokens_dict).
+        """
+        if GenerativeModel is None or GenerationConfig is None:
+            raise RuntimeError(
+                "google-cloud-aiplatform is not installed. "
+                "Run: pip install google-cloud-aiplatform"
+            )
+
+        # Ensure vertexai.init() has been called (triggers lazy init)
+        _ = self.gemini_client
+
+        client = GenerativeModel(MODEL_MAPPING[model])
+
+        if msg is None:
+            messages = prompt
+        else:
+            messages = msg
+
+        generation_config = GenerationConfig(
+            temperature=temperature,
+            max_output_tokens=max_tokens,
+        )
+
+        response = client.generate_content(
+            messages,
+            generation_config=generation_config,
+        )
+
+        # Extract final answer — handle multi-turn / tool-call responses
+        final_answer = self._process_gemini_response(response)
+
+        input_tokens  = response.usage_metadata.prompt_token_count
+        output_tokens = response.usage_metadata.candidates_token_count
+
+        tokens = {
+            'input_tokens':  input_tokens,
+            'output_tokens': output_tokens,
+        }
+
+        return final_answer, tokens
+
+    def _process_gemini_response(self, response) -> str:
+        """Extract the text content from a Gemini GenerateContentResponse.
+
+        Handles simple text responses and multi-part candidates gracefully.
+        """
+        try:
+            # Fast path: single text candidate
+            return response.text
+        except (AttributeError, ValueError):
+            pass
+
+        # Walk candidates → parts to collect all text
+        texts = []
+        for candidate in getattr(response, 'candidates', []):
+            for part in getattr(candidate.content, 'parts', []):
+                text = getattr(part, 'text', None)
+                if text:
+                    texts.append(text)
+
+        if texts:
+            return '\n'.join(texts)
+
+        return "(Gemini returned no text content)"
 
     @retry_decorator(max_retries=3, delay=1, backoff=2)
     def call_local(self, model: str, prompt: str, temperature: float = 0.001, msg: list = None) -> str:

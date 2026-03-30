@@ -324,7 +324,7 @@ class State:
         # Only summarize new stages
         if pending_stage_ids:
             # Use LLM to create concise summaries
-            summarize_service = ModelService(model='gpt-4o-mini')
+            summarize_service = ModelService(model='gemini-2.5-flash')
 
             for stage_id in pending_stage_ids:
                 # Build raw information for this stage

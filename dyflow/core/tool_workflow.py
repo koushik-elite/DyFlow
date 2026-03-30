@@ -1,0 +1,550 @@
+"""
+dyflow/core/tool_workflow.py
+────────────────────────────
+ToolAwareWorkflowExecutor — extends DyFlow's WorkflowExecutor to support
+external tool operators (WEB_SEARCH, SQL_QUERY) via the ToolRegistry.
+
+Key changes vs. original WorkflowExecutor
+──────────────────────────────────────────
+1. Accepts a ToolRegistry at init time.
+2. In _execute_stage(), checks whether each operator's instruction_type
+   is a tool operator or a tool-aware LLM operator, and dispatches
+   accordingly — everything else routes to the original LLM executor path.
+3. Adds TOOL_REVIEW verdict-driven branching:
+   after a TOOL_REVIEW operator, if verdict == 'retry_with_refinement',
+   the executor inserts a TOOL_REFINE stage before continuing.
+4. Adds updated DESIGN_STAGE_PROMPT that includes the new operator types.
+5. Is a drop-in replacement — existing DyFlow tasks run unchanged.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import re
+from typing import Any, Dict, List, Optional, Tuple
+
+from .tool_operator import (
+    ToolExecutorOperator,
+    ToolAwareLLMOperator,
+    TOOL_PROMPT_TEMPLATES,
+    parse_tool_review_verdict,
+)
+from ..tools.registry import ToolRegistry
+
+logger = logging.getLogger(__name__)
+
+
+# ── JSON repair helper ────────────────────────────────────────────────────────
+
+def _repair_json(text: str) -> Optional[Dict]:
+    """
+    Attempt to fix a truncated JSON string by closing all open brackets.
+    Returns parsed dict on success, None on failure.
+    """
+    # Remove any trailing incomplete key-value pair (e.g. `  "key": `)
+    text = re.sub(r',?\s*"[^"]*"\s*:\s*$', '', text.rstrip())
+    text = text.rstrip().rstrip(',')
+
+    # Count and close unclosed brackets/braces
+    stack = []
+    in_string = False
+    escape = False
+    for ch in text:
+        if escape:
+            escape = False
+            continue
+        if ch == '\\' and in_string:
+            escape = True
+            continue
+        if ch == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if ch in ('{', '['):
+            stack.append('}' if ch == '{' else ']')
+        elif ch in ('}', ']'):
+            if stack and stack[-1] == ch:
+                stack.pop()
+
+    # Close any remaining open brackets in reverse order
+    closing = ''.join(reversed(stack))
+    repaired_text = text + closing
+
+    try:
+        return json.loads(repaired_text)
+    except Exception:
+        return None
+# UPDATED DESIGN STAGE PROMPT  (includes tool operators)
+# ══════════════════════════════════════════════════════════════════════════════
+
+TOOL_DESIGN_STAGE_PROMPT = """
+You are the workflow stage designer for DyFlow-T, an extended DyFlow agent
+with access to external tools.
+
+Original Problem:
+{problem_description}
+
+Current Execution Summary:
+{state_summary}
+
+# Available Operators and When to Use
+
+## Reasoning Operators (LLM-executed)
+1. DECOMPOSE_PROBLEM   — Break down a complex problem into 2–4 sub-goals.
+2. GENERATE_PLAN       — Create a step-by-step plan for the current subgoal.
+3. GENERATE_ANSWER     — Generate a complete solution with step-by-step reasoning.
+4. REFINE_ANSWER       — Improve an existing solution based on review feedback.
+5. REVIEW_SOLUTION     — Critically evaluate a solution for correctness.
+6. GENERATE_CODE       — Write Python code to solve the current subgoal.
+7. REFINE_CODE         — Improve or debug previously generated code.
+8. ENSEMBLE            — Generate multiple solutions and select best by majority vote.
+9. ORGANIZE_SOLUTION   — Format the final answer and TERMINATE the workflow.
+10. DEFAULT            — General-purpose fallback operator.
+
+## Tool Operators (External tool execution)
+11. SEARCH_QUERY_FORMULATE — Construct the optimal web search query before retrieval.
+    Use when: the subgoal requires external factual knowledge and the query needs refinement.
+    Output: formulated_query_{{id}}
+
+12. WEB_SEARCH         — Retrieve REAL current information from the web.
+    PURPOSE: The tool fetches actual web content — not LLM memory or assumptions.
+    Use when: the task requires current facts the LLM cannot know (prices, dates, live data).
+    Always pair with: SEARCH_QUERY_FORMULATE → WEB_SEARCH → TOOL_REVIEW → RESULT_EXTRACT
+    Output: search_result_{{id}}
+
+13. SQL_GENERATE       — Write a precise SQLite SELECT query (LLM reasoning step).
+    PURPOSE: Both DyFlow and DyFlow-T can generate SQL — this is pure LLM reasoning.
+    Use when: BEFORE every SQL_QUERY — generates the SQL statement to be executed.
+    Output key must contain "sql_generate" (e.g. "sql_generate_{{id}}")
+    Input keys: ["schema", "question"]
+
+14. SQL_QUERY          — EXECUTE the SQL against the real database and return actual rows.
+    PURPOSE: This is the key differentiator — the tool runs the SQL and returns REAL data.
+    Without this tool, the LLM must guess what rows the query would return (unreliable).
+    With this tool, actual database rows are returned — ground truth for any question.
+    ALWAYS pair with: SQL_GENERATE → SQL_QUERY → TOOL_REVIEW → RESULT_EXTRACT
+    Output: sql_result_{{id}}
+
+15. TOOL_REVIEW        — Audit tool output quality and relevance.
+    Use when: immediately after WEB_SEARCH or SQL_QUERY.
+    Output verdict: accept / retry_with_refinement / reject
+    Output: tool_review_{{id}}
+
+16. TOOL_REFINE        — Diagnose and correct a failed tool call.
+    Use when: TOOL_REVIEW verdict is 'retry_with_refinement'.
+    Output: tool_refined_result_{{id}}
+
+17. RESULT_EXTRACT     — Distil real tool output into a clean final answer.
+    Use when: after TOOL_REVIEW verdict is 'accept', before ORGANIZE_SOLUTION.
+    For SQL: reads the actual returned rows and extracts the direct answer.
+    Output: extracted_result_{{id}}
+
+# Design Rules
+
+1. Stage Structure:
+   - Web search pattern: SEARCH_QUERY_FORMULATE → WEB_SEARCH → TOOL_REVIEW → RESULT_EXTRACT
+   - SQL pattern: SQL_GENERATE → SQL_QUERY → TOOL_REVIEW → RESULT_EXTRACT
+   - Termination stage: ONLY ORGANIZE_SOLUTION — never mix with other operators
+   - Maximum 7 stages total
+
+2. Naming Conventions:
+   - Stage IDs: Increase monotonically (e.g., "stage_1", "stage_2", "stage_3")
+   - Operator IDs: Format "op_<stageNum>_<index>" (e.g., "op_3_1", "op_3_2")
+   - Output keys: Use exact keys from the summary; never invent new ones
+
+3. Input Keys:
+   - SQL_GENERATE: use input_keys ["schema", "question"] — pre-seeded from problem description
+   - SQL_QUERY: no explicit input_keys needed — reads SQL_GENERATE output automatically
+   - RESULT_EXTRACT: include the sql_result or search_result key from the tool output
+   - For any reasoning operator needing the problem: include "original_problem" in input_keys
+
+4. Tool Selection Guidelines:
+   - Structured data question (counts, joins, aggregates) → SQL_GENERATE → SQL_QUERY chain
+   - Current/external facts (prices, recent events, live data) → WEB_SEARCH chain
+   - Self-contained logical reasoning → pure reasoning operators (no tools needed)
+   - Never use WEB_SEARCH and SQL_QUERY in the same stage
+
+Output Format:
+Return valid JSON:
+{{
+  "stage_id": "stage_N",
+  "stage_description": "One-sentence description of what this stage accomplishes",
+  "operators": [
+    {{
+      "operator_id": "op_N_1",
+      "operator_description": "What this specific operator does",
+      "params": {{
+        "instruction_type": "OPERATOR_NAME",
+        "input_keys": ["key1", "key2"],
+        "output_key": "act_X",
+        "input_usage": "How to use the input_keys data"
+      }}
+    }}
+  ]
+}}
+"""
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TOOL-AWARE WORKFLOW EXECUTOR
+# ══════════════════════════════════════════════════════════════════════════════
+
+class ToolAwareWorkflowExecutor:
+    """
+    Drop-in replacement for DyFlow's WorkflowExecutor that adds external
+    tool support via ToolRegistry.
+
+    Parameters
+    ----------
+    problem_description : str
+        The task / question to solve.
+    designer_service    : ModelService
+        LLM service used by the designer (DyPlanner or GPT-4.1).
+    executor_service    : ModelService
+        LLM service used by reasoning operators.
+    tool_registry       : ToolRegistry
+        Pre-configured registry with WebSearchTool / SQLQueryTool.
+    save_design_history : bool
+        If True, appends each designed stage to state.design_history.
+    max_tool_retries    : int
+        Max TOOL_REFINE iterations before escalating.
+    """
+
+    def __init__(
+        self,
+        problem_description: str,
+        designer_service,
+        executor_service,
+        tool_registry:        ToolRegistry,
+        save_design_history:  bool = False,
+        max_tool_retries:     int = 2,
+    ) -> None:
+        self.problem_description = problem_description
+        self.designer_service    = designer_service
+        self.executor_service    = executor_service
+        self.tool_registry       = tool_registry
+        self.save_design_history = save_design_history
+        self.max_tool_retries    = max_tool_retries
+
+        # Lazy import to avoid circular dependency with original codebase
+        from .state import State
+        self.state = State(original_problem=problem_description)
+
+        # Pre-seed any structured fields embedded in the problem description
+        # into state.actions so operators can reference them via input_keys.
+        # e.g. "Database: e_commerce\n\nSchema:\nCREATE TABLE ..."
+        # becomes state.actions["database"] and state.actions["schema"]
+        self._seed_problem_fields(problem_description)
+
+    # ── Public entry point ────────────────────────────────────────────────────
+
+    def run(self, max_steps: int = 4) -> Tuple[str, Any]:
+        """
+        Execute the tool-augmented DyFlow loop.
+
+        Returns
+        -------
+        (final_answer: str, trajectory: list)
+        """
+        logger.info(f"[ToolAwareWorkflowExecutor] Starting | steps={max_steps}")
+        print(f"\n{'='*60}")
+        print(f"DyFlow-T  |  Problem: {self.problem_description[:80]}...")
+        print(f"{'='*60}\n")
+
+        for step in range(max_steps):
+            print(f"\n>>> Stage {step + 1} / {max_steps}")
+
+            # 1. Designer produces next stage JSON
+            stage_json = self._design_stage()
+            if stage_json is None:
+                logger.warning("Designer returned invalid JSON — stopping.")
+                break
+
+            stage_id   = stage_json.get("stage_id", f"stage_{step+1}")
+            operators  = stage_json.get("operators", [])
+            terminated = False
+
+            # Register stage so InstructExecutorOperator can log history to it
+            if stage_id not in self.state.stages:
+                self.state.stages[stage_id] = {
+                    "description": stage_json.get("stage_description", ""),
+                    "status": "executing",
+                    "history": [],
+                }
+
+            # 2. Execute each operator in the stage
+            for op_def in operators:
+                op_id   = op_def.get("operator_id", "op_unknown")
+                op_desc = op_def.get("operator_description", "")
+                params  = op_def.get("params", {})
+                instr   = params.get("instruction_type", "").upper()
+
+                # Required by InstructExecutorOperator to log into stage history
+                params["target_stage_id"] = stage_id
+
+                print(f"  [{op_id}] {instr}: {op_desc[:60]}")
+
+                signal = self._dispatch_operator(op_id, op_desc, instr, params)
+
+                # Handle TOOL_REVIEW verdict-driven branching
+                if instr == "TOOL_REVIEW":
+                    signal = self._handle_tool_review_branch(op_id, params, operators)
+
+                if signal == "terminate" or instr == "ORGANIZE_SOLUTION":
+                    terminated = True
+                    break
+
+            if self.save_design_history:
+                self.state.design_history = getattr(self.state, "design_history", [])
+                self.state.design_history.append(stage_json)
+
+            if terminated:
+                print("\n[DyFlow-T] Workflow complete.")
+                break
+
+        return self._extract_final_answer(), getattr(self.state, "workflow_log", [])
+
+    # ── Designer call ─────────────────────────────────────────────────────────
+
+    def _design_stage(self) -> Optional[Dict]:
+        summary = self._summarise_state()
+        prompt = (
+            TOOL_DESIGN_STAGE_PROMPT
+            .replace("{problem_description}", self.problem_description)
+            .replace("{state_summary}", summary)
+        )
+        raw = ""
+        try:
+            # Use 8192 tokens — designer JSON can be large
+            response = self.designer_service.generate(
+                prompt=prompt, temperature=0.1, max_tokens=8192
+            )
+            raw = response.get("response", "") if isinstance(response, dict) else str(response)
+
+            # Strip markdown fences (```json ... ``` or ``` ... ```)
+            clean = re.sub(r"```(?:json)?\s*", "", raw).replace("```", "").strip()
+
+            # Extract the first complete JSON object
+            match = re.search(r"\{.*\}", clean, re.DOTALL)
+            if match:
+                candidate = match.group()
+            else:
+                candidate = clean
+
+            # Try strict parse first
+            try:
+                return json.loads(candidate)
+            except json.JSONDecodeError:
+                # Attempt to repair truncated JSON by closing open brackets
+                repaired = _repair_json(candidate)
+                if repaired:
+                    return repaired
+                raise
+
+        except Exception as exc:
+            logger.error(f"Designer JSON parse error: {exc}\nRaw: {raw[:300]}")
+            return None
+
+    # ── Operator dispatch ─────────────────────────────────────────────────────
+
+    def _dispatch_operator(
+        self,
+        op_id:   str,
+        op_desc: str,
+        instr:   str,
+        params:  Dict[str, Any],
+    ) -> str:
+        """
+        Route the operator to:
+          - ToolExecutorOperator   if instruction_type is in TOOL_OPERATOR_TYPES
+          - ToolAwareLLMOperator   if instruction_type is in TOOL_AWARE_OPERATOR_TYPES
+          - InstructExecutorOperator (original) for all other operators
+        """
+        params["instruction_type"] = instr
+
+        if self.tool_registry.is_tool_operator(instr):
+            op = ToolExecutorOperator(op_id, op_desc, self.tool_registry)
+            return op.execute(self.state, params)
+
+        elif self.tool_registry.is_tool_aware(instr):
+            llm_client = self._make_llm_client()
+            op = ToolAwareLLMOperator(op_id, op_desc, llm_client)
+            return op.execute(self.state, params)
+
+        else:
+            # Original DyFlow path
+            from .operator import InstructExecutorOperator
+            op = InstructExecutorOperator(op_id, op_desc, self.executor_service)
+            return op.execute(self.state, params)
+
+    # ── TOOL_REVIEW branching ─────────────────────────────────────────────────
+
+    def _handle_tool_review_branch(
+        self,
+        review_op_id: str,
+        review_params: Dict,
+        stage_operators: List[Dict],
+    ) -> str:
+        """
+        After TOOL_REVIEW runs, check its verdict.
+        If 'retry_with_refinement', inject a TOOL_REFINE operator inline.
+        """
+        review_key = review_params.get("output_key", review_op_id)
+        path       = f"actions.{review_key}.content"
+        content    = self.state.get_data_by_path(path) or ""
+        verdict    = parse_tool_review_verdict(content)
+
+        print(f"    TOOL_REVIEW verdict: {verdict}")
+
+        if verdict == "retry_with_refinement":
+            self._run_tool_refine_inline(review_op_id, review_params)
+        elif verdict == "reject":
+            logger.warning(f"[TOOL_REVIEW] verdict=reject | escalating to designer replan")
+        # accept (or defaulted to accept) — continue normally
+
+        return "next"
+
+    def _run_tool_refine_inline(self, review_op_id: str, review_params: Dict) -> None:
+        """Inline TOOL_REFINE execution (up to max_tool_retries)."""
+        retries = getattr(self.state, "_tool_refine_count", 0)
+        if retries >= self.max_tool_retries:
+            logger.warning("Max tool retries reached — skipping TOOL_REFINE.")
+            return
+
+        self.state._tool_refine_count = retries + 1
+        refine_op_id = f"tool_refine_{retries + 1}"
+        refine_params = {
+            "instruction_type": "TOOL_REFINE",
+            "input_keys":       review_params.get("input_keys", []) + [review_params.get("output_key", "")],
+            "output_key":       f"tool_refined_result_{retries + 1}",
+            "input_usage":      "Use the review verdict and original tool output to reformulate the query.",
+        }
+        print(f"    [Inline TOOL_REFINE] attempt {retries + 1}")
+        self._dispatch_operator(refine_op_id, "Refine failed tool call", "TOOL_REFINE", refine_params)
+
+        # Re-run the original tool with refined query
+        self._rerun_tool_with_refined_query(review_params, retries)
+
+    def _rerun_tool_with_refined_query(self, review_params: Dict, attempt: int) -> None:
+        """Re-execute the tool using the refined query from TOOL_REFINE output."""
+        refine_key  = f"tool_refined_result_{attempt + 1}"
+        path        = f"actions.{refine_key}.content"
+        refine_text = self.state.get_data_by_path(path) or ""
+
+        refined_query_match = re.search(r"Refined Query\s*:\s*(.+?)(?:\n|$)", refine_text, re.IGNORECASE)
+        if not refined_query_match:
+            logger.warning("Could not parse refined query from TOOL_REFINE output.")
+            return
+
+        refined_query = refined_query_match.group(1).strip()
+        logger.info(f"[TOOL_REFINE] Refined query: {refined_query}")
+
+        # Find which tool to re-run from the original tool output keys
+        for op_type in ["WEB_SEARCH", "SQL_QUERY"]:
+            if self.tool_registry.get(op_type):
+                rerun_op_id    = f"tool_rerun_{op_type.lower()}_{attempt + 1}"
+                rerun_params   = {
+                    "instruction_type": op_type,
+                    "input_keys":       [],
+                    "output_key":       f"search_result_refined_{attempt + 1}",
+                    "input_usage":      f"Re-execute with refined query: {refined_query}",
+                    "guidance":         refined_query,
+                    "query":            refined_query,
+                }
+                print(f"    [Re-run {op_type}] query='{refined_query[:60]}'")
+                self._dispatch_operator(rerun_op_id, f"Re-run {op_type}", op_type, rerun_params)
+                break
+
+    def _seed_problem_fields(self, problem_description: str) -> None:
+        """
+        Parse labelled sections from the problem description and pre-populate
+        state.actions so operators can reference them via input_keys.
+
+        Handles two formats:
+          Single-line:  "Database: e_commerce"
+          Multi-line:   "Schema:\nCREATE TABLE ..."  (runs until next label or EOF)
+        """
+        # Match "Label:" at the start of a line followed by content
+        pattern = re.compile(
+            r"^([A-Za-z][A-Za-z0-9_ ]{0,30})\s*:\s*(.+?)(?=\n[A-Za-z][A-Za-z0-9_ ]{0,30}\s*:|$)",
+            re.MULTILINE | re.DOTALL,
+        )
+        for match in pattern.finditer(problem_description):
+            key     = match.group(1).strip().lower().replace(" ", "_")
+            value   = match.group(2).strip()
+            if key and value:
+                self.state.actions[key] = {"content": value}
+                logger.debug(f"[seed] {key} = {value[:60]}")
+
+    # ── State utilities ───────────────────────────────────────────────────────
+
+    def _summarise_state(self) -> str:
+        """Build a compact summary of state for the designer prompt."""
+        lines = [f"Problem: {self.state.original_problem[:200]}"]
+        for key, action in self.state.actions.items():
+            content = action.get("content", "")
+            preview = content[:300].replace("\n", " ") if content else "(empty)"
+            lines.append(f"- [{key}]: {preview}")
+        return "\n".join(lines)
+
+    def _extract_final_answer(self) -> str:
+        """
+        Extract the best final answer from state actions.
+
+        Priority:
+          1. Any action with 'final_answer' or 'ORGANIZE_SOLUTION' output key
+          2. 'Final Answer:' line inside any RESULT_EXTRACT / extracted action
+          3. 'Summary:' line from a RESULT_EXTRACT action
+          4. Last action with meaningful content
+        """
+        actions = self.state.actions
+
+        # 1. Explicit final_answer / organise output
+        for key in actions:
+            if any(tok in key.lower() for tok in ("final_answer", "organiz")):
+                content = actions[key].get("content", "").strip()
+                if content and len(content) > 5:
+                    return content
+
+        # 2. Parse 'Final Answer:' line from any RESULT_EXTRACT output
+        for key in actions:
+            if any(tok in key.lower() for tok in ("extract", "result")):
+                content = actions[key].get("content", "")
+                match = re.search(r"Final Answer\s*:\s*(.+?)(?:\n|$)", content, re.IGNORECASE)
+                if match:
+                    answer = match.group(1).strip()
+                    if answer and answer.lower() not in ("none", "n/a", "(not available)"):
+                        return answer
+
+        # 3. Parse 'Summary:' as a fallback
+        for key in actions:
+            if any(tok in key.lower() for tok in ("extract", "result")):
+                content = actions[key].get("content", "")
+                match = re.search(r"Summary\s*:\s*(.+?)(?:\n|$)", content, re.IGNORECASE)
+                if match:
+                    summary = match.group(1).strip()
+                    if summary and len(summary) > 10:
+                        return summary
+
+        # 4. Last action with meaningful content
+        for action in reversed(list(actions.values())):
+            content = action.get("content", "").strip()
+            if content and len(content) > 10:
+                return content
+
+        return ""
+
+    def _make_llm_client(self):
+        """Create a thin wrapper around executor_service for ToolAwareLLMOperator."""
+        service = self.executor_service
+
+        class _LLMClientWrapper:
+            def chat(self, prompt: str) -> str:
+                result = service.generate(prompt=prompt)
+                if isinstance(result, dict):
+                    return result.get("response", "") or ""
+                return str(result)
+
+        return _LLMClientWrapper()

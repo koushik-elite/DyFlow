@@ -36,7 +36,7 @@ class ModelService:
             cls._clients = ModelClients()
         return cls._clients
 
-    def __init__(self, model: str = 'chatgpt-4o-latest', temperature: float = 0.01, lock: threading.Lock = None):
+    def __init__(self, model: str = 'gemini-2.5-flash', temperature: float = 0.01, lock: threading.Lock = None):
         """
         Initialize the model service with a specific model
         
@@ -62,7 +62,7 @@ class ModelService:
         self.lock = lock
         
     @classmethod
-    def create(cls, model: str = 'chatgpt-4o-latest', temperature: float = 0.01) -> 'ModelService':
+    def create(cls, model: str = 'gemini-2.5-flash', temperature: float = 0.01) -> 'ModelService':
         """Factory method to create a new ModelService instance"""
         return cls(model=model, temperature=temperature)
     
@@ -76,6 +76,11 @@ class ModelService:
         """Create a ModelService instance with Claude 3.5 Sonnet"""
         return cls(model='claude-3.5-sonnet', temperature=temperature)
     
+    @classmethod
+    def gemini(cls, model: str = 'gemini-2.5-flash', temperature: float = 0.01) -> 'ModelService':
+        """Create a ModelService instance with a Gemini model"""
+        return cls(model=model, temperature=temperature)
+
     @classmethod
     def local(cls, temperature: float = 0.01, lock: threading.Lock = None) -> 'ModelService':
         """Create a ModelService instance with local model server"""
@@ -129,6 +134,8 @@ class ModelService:
         # Get response based on model type
         if self.model_category == 'anthropic':
             response, tokens = self.clients.call_anthropic(self.model, prompt, temperature, max_tokens, msg)
+        elif self.model_category == 'gemini':
+            response, tokens = self.clients.call_gemini(self.model, prompt, temperature, max_tokens, msg)
         elif self.model_category == 'local':
             if self.lock:
                 with self.lock:
@@ -180,6 +187,13 @@ class ModelService:
         if self.model_category == 'anthropic':
             response, tokens = await self.clients.call_anthropic_async(
                 self.model, prompt, temperature, max_tokens
+            )
+        elif self.model_category == 'gemini':
+            # Gemini SDK does not expose a native async client yet; run sync in executor
+            import asyncio
+            loop = asyncio.get_event_loop()
+            response, tokens = await loop.run_in_executor(
+                None, lambda: self.clients.call_gemini(self.model, prompt, temperature, max_tokens)
             )
         else:
             response, tokens = await self.clients.call_openai_compatible_async(
