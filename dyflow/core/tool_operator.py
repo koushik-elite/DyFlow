@@ -442,20 +442,26 @@ class ToolExecutorOperator(Operator):
         guidance = params.get("guidance", params.get("input_usage", ""))
 
         if instruction_type == "WEB_SEARCH":
-            # Prefer a formulated query from memory
-            query = (
-                resolved_inputs.get("query")
-                or self._find_formulated_query(state)
-                or guidance.strip()
+            # Priority: a TOOL_REFINE refinement (latest correction) wins over
+            # the original SEARCH_QUERY_FORMULATE output, which wins over a
+            # literal "query" key, which wins over the designer's static guidance.
+            refined    = self._find_refined_query(state)
+            formulated = self._find_formulated_query(state)
+            query, source = (
+                (refined,                       "refined_query")    if refined    else
+                (formulated,                    "formulated_query") if formulated else
+                (resolved_inputs.get("query"),  "input_keys.query") if resolved_inputs.get("query") else
+                (guidance.strip(),              "guidance")
             )
+            print(f"  Query source: {source}")
             return {"query": query, "top_k": params.get("top_k", 5)}
 
         elif instruction_type == "SQL_QUERY":
             query = (
-                resolved_inputs.get("sql_query")
+                self._find_refined_query(state)
+                or resolved_inputs.get("sql_query")
                 or resolved_inputs.get("query")
                 or self._find_generated_sql(state)
-                or self._find_refined_query(state)
                 or guidance.strip()
             )
             # Strip any residual markdown fences or "SQL:" prefix
@@ -469,14 +475,20 @@ class ToolExecutorOperator(Operator):
         return {"query": guidance.strip()}
 
     def _find_formulated_query(self, state: State) -> Optional[str]:
-        """Scan state memory for the output of a SEARCH_QUERY_FORMULATE operator."""
+        """
+        Scan all state actions for SEARCH_QUERY_FORMULATE output and return the
+        latest 'Primary Query: ...' value.
+
+        Match on the content pattern, NOT the action key — designers assign
+        generic keys (act_0, op_1_1) so a key-based filter would never match.
+        """
+        latest: Optional[str] = None
         for key, val in state.actions.items():
-            if "formulated_query" in key or "search_query" in key:
-                content = val.get("content", "")
-                match   = re.search(r"Primary Query\s*:\s*(.+?)(?:\n|$)", content, re.IGNORECASE)
-                if match:
-                    return match.group(1).strip().strip("`")
-        return None
+            content = val.get("content", "")
+            match   = re.search(r"Primary Query\s*:\s*(.+?)(?:\n|$)", content, re.IGNORECASE)
+            if match:
+                latest = match.group(1).strip().strip("`")
+        return latest
 
     def _find_generated_sql(self, state: State) -> Optional[str]:
         """Scan state memory for SQL_GENERATE output and extract the SQL statement."""
@@ -496,14 +508,21 @@ class ToolExecutorOperator(Operator):
         return None
 
     def _find_refined_query(self, state: State) -> Optional[str]:
-        """Scan state memory for a TOOL_REFINE refined query."""
+        """
+        Scan all state actions for TOOL_REFINE output and return the latest
+        'Refined Query: ...' value.
+
+        Match on the content pattern, NOT the action key — without this, a
+        TOOL_REFINE result stored under a generic id like 'op_2_3' is invisible
+        and the executor keeps replaying the original (broken) query.
+        """
+        latest: Optional[str] = None
         for key, val in state.actions.items():
-            if "refined" in key:
-                content = val.get("content", "")
-                parsed  = parse_refined_query(content)
-                if parsed:
-                    return parsed
-        return None
+            content = val.get("content", "")
+            parsed  = parse_refined_query(content)
+            if parsed:
+                latest = parsed
+        return latest
 
     def _store_output(self, state: State, output_key: str, content: str) -> None:
         full_key = (

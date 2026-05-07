@@ -1,5 +1,6 @@
 import sys
 import os
+import time
 
 # Load environment variables from .env file
 try:
@@ -12,6 +13,7 @@ except ImportError:
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from dyflow import ModelService
+from dyflow.core.workflow import WorkflowExecutor
 from dyflow.core.tool_workflow import ToolAwareWorkflowExecutor
 from dyflow.tools.registry import ToolRegistry
 from dyflow.tools.web_search import WebSearchTool, MockWebSearchTool
@@ -28,7 +30,6 @@ def build_tool_registry() -> ToolRegistry:
     registry = ToolRegistry()
 
     # ── Web Search ────────────────────────────────────────────────────────────
-    tavily_key = os.getenv("TAVILY_API_KEY", "")
     tavily_key = os.getenv("TAVILY_API_KEY", "")
     if tavily_key:
         print("[Tools] WebSearchTool → live (Tavily)")
@@ -50,66 +51,123 @@ def build_tool_registry() -> ToolRegistry:
     return registry
 
 
+def run_dyflow(problem: str, designer: ModelService, executor: ModelService):
+    """
+    DyFlow baseline — no tools, parametric memory only.
+    Returns (answer, design_history).
+    """
+    wf = WorkflowExecutor(
+        problem_description=problem,
+        designer_service=designer,
+        executor_service=executor,
+        save_design_history=True,
+    )
+    try:
+        answer = wf.execute()
+        history = getattr(wf.state, "design_history", [])
+        return str(answer) if answer else "", history
+    except Exception as e:
+        return f"ERROR: {e}", []
+
+
+def run_dyflow_t(problem: str, designer: ModelService, executor: ModelService,
+                 tool_registry: ToolRegistry):
+    """
+    DyFlow-T — tool-augmented (web search + SQL).
+    Returns (answer, design_history, trajectory, tool_results).
+    """
+    wf = ToolAwareWorkflowExecutor(
+        problem_description=problem,
+        designer_service=designer,
+        executor_service=executor,
+        tool_registry=tool_registry,
+        save_design_history=True,
+        max_tool_retries=2,
+    )
+    try:
+        answer, trajectory = wf.run(max_steps=15)
+        history      = getattr(wf.state, "design_history", [])
+        tool_results = getattr(wf.state, "tool_results", {})
+        return answer or "", history, trajectory, tool_results
+    except Exception as e:
+        return f"ERROR: {e}", [], [], {}
+
+
 def main():
     """
-    Run DyFlow-T (tool-augmented) on a sample problem that exercises
-    both web search and SQL retrieval.
+    Run DyFlow (no tools) and DyFlow-T (tool-augmented) side-by-side
+    on a sample problem that exercises both web search and structured lookup.
     """
-    # Problem that benefits from both web search and structured data lookup
+    
     problem_description = """
-    Answer the following research question using available tools:
-
-    What is the current population of Tokyo, and how does it compare
-    to the populations of New York City and London?
-    Provide a summary table with the three cities and their populations.
+    I am a US-based investor with $10,000. 
+    Convert it to INR at today's exchange rate, then calculate how many grams of gold I can buy at today's Indian gold rate. 
+    What is my investment worth in USD if gold grows '15%' annually over 9 months?
     """
 
-    print("=" * 60)
-    print("DyFlow-T  |  Tool-Augmented Workflow")
-    print("=" * 60)
+    print("=" * 70)
+    print("DyFlow vs DyFlow-T  |  Side-by-side workflow comparison")
+    print("=" * 70)
+    print("\nProblem:")
+    print(problem_description.strip())
+    print()
 
     # ── Model services (both Gemini) ──────────────────────────────────────────
     designer_service = ModelService(model="gemini-2.5-flash")
     executor_service = ModelService(model="gemini-2.5-flash")
 
-    # ── Tool registry (WebSearch + SQL) ───────────────────────────────────────
+    # ── Tool registry (only DyFlow-T uses it) ─────────────────────────────────
+    print("-" * 70)
+    print("Building tool registry (used by DyFlow-T only)...")
     tool_registry = build_tool_registry()
-    print(f"[Tools] Registered: {tool_registry.registered_tools()}\n")
+    print(f"[Tools] Registered: {tool_registry.registered_tools()}")
+    print("-" * 70)
 
-    # ── ToolAwareWorkflowExecutor ─────────────────────────────────────────────
-    executor = ToolAwareWorkflowExecutor(
-        problem_description=problem_description,
-        designer_service=designer_service,
-        executor_service=executor_service,
-        tool_registry=tool_registry,
-        save_design_history=True,
-        max_tool_retries=2,
+    # ── DyFlow baseline (no tools) ────────────────────────────────────────────
+    print("\n[1/2] Running DyFlow (no tools — parametric memory only)...")
+    t0 = time.time()
+    df_answer, df_history = run_dyflow(problem_description, designer_service, executor_service)
+    t_df = time.time() - t0
+    print(f"      done in {t_df:.1f}s  |  design stages: {len(df_history)}")
+
+    # ── DyFlow-T (web + SQL) ──────────────────────────────────────────────────
+    print("\n[2/2] Running DyFlow-T (tool-augmented)...")
+    t0 = time.time()
+    dft_answer, dft_history, dft_trajectory, dft_tool_results = run_dyflow_t(
+        problem_description, designer_service, executor_service, tool_registry
     )
-
-    # ── Run ───────────────────────────────────────────────────────────────────
-    print("Starting DyFlow-T execution...")
-    print("-" * 60)
-    final_answer, trajectory = executor.run(max_steps=4)
+    t_dft = time.time() - t0
+    print(f"      done in {t_dft:.1f}s  |  design stages: {len(dft_history)}")
 
     # ── Results ───────────────────────────────────────────────────────────────
-    print("\n" + "=" * 60)
-    print("WORKFLOW EXECUTION COMPLETE")
-    print("=" * 60)
+    print("\n" + "=" * 70)
+    print("RESULTS")
+    print("=" * 70)
 
-    print("\n=== Final Answer ===")
-    print(final_answer)
+    print("\n--- DyFlow (no tools) ---")
+    print(f"Elapsed : {t_df:.1f}s")
+    print(f"Stages  : {len(df_history)}")
+    print(f"Answer  :\n{df_answer}\n")
 
-    print("\n=== Tool Usage Summary ===")
-    tool_results = getattr(executor.state, "tool_results", {})
-    if tool_results:
-        for key, result in tool_results.items():
+    print("--- DyFlow-T (tool-augmented) ---")
+    print(f"Elapsed : {t_dft:.1f}s")
+    print(f"Stages  : {len(dft_history)}")
+    print(f"Answer  :\n{dft_answer}\n")
+
+    # ── Tool usage summary (DyFlow-T only) ────────────────────────────────────
+    print("--- DyFlow-T Tool Usage ---")
+    if dft_tool_results:
+        for key, result in dft_tool_results.items():
             print(f"  [{key}] {result.tool_name} | status={result.status.value} | elapsed={result.elapsed_sec:.2f}s")
     else:
         print("  No tool calls were made.")
 
-    print("\n=== Operator Execution Log ===")
-    for entry in trajectory[-5:]:   # show last 5 log entries
+    # ── Operator log (last 5) ─────────────────────────────────────────────────
+    print("\n--- DyFlow-T Operator Log (last 5) ---")
+    for entry in dft_trajectory[-5:]:
         print(f"  {entry.get('operator_type', '?')} [{entry.get('operator_id', '?')}] → {entry.get('status', '?')}")
+
+    print("=" * 70)
 
 
 if __name__ == "__main__":
