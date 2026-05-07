@@ -1,0 +1,35 @@
+[project]
+name = "dyflow-t"
+version = "0.1.0"
+description = "DyFlow: Dynamic Workflow Framework for Agentic Reasoning (NeurIPS 2025)"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.12"
+dependencies = [
+    "openai",
+    "anthropic",
+    "python-dotenv",
+    "tiktoken",
+    "numpy",
+    "pandas",
+    "requests",
+    "tqdm",
+    "google-cloud-aiplatform",
+    "tavily-python",
+]
+
+[project.optional-dependencies]
+vllm = ["vllm"]
+dev = [
+    "pytest",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["dyflow"]
+
+[tool.uv]
+package = true
